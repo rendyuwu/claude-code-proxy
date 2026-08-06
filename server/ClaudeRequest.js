@@ -38,6 +38,9 @@ const loadConfig = () => {
 const CONFIG = loadConfig();
 const FILTER_SAMPLING_PARAMS = CONFIG.filter_sampling_params === true; // Default to false
 const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Default to true
+// Socket inactivity timeout, not a total deadline: streaming responses keep
+// resetting it, so only a genuinely stalled upstream trips it.
+const UPSTREAM_TIMEOUT_MS = parseInt(CONFIG.upstream_timeout_ms, 10) || 300000;
 
 class ClaudeRequest {
   static presetCache = new Map();
@@ -245,7 +248,10 @@ class ClaudeRequest {
       'Content-Type': 'application/json',
       'Authorization': token,
       'anthropic-version': this.VERSION,
-      'User-Agent': 'claude-code-proxy/1.0.0'
+      'User-Agent': 'claude-code-proxy/1.0.0',
+      // The non-streaming path re-serializes the body without decompressing it,
+      // so ask upstream not to compress in the first place.
+      'Accept-Encoding': 'identity'
     };
 
     if (this.BETA_HEADER) {
@@ -310,6 +316,27 @@ class ClaudeRequest {
     processed = this.filterSamplingParams(processed);
 
     return processed;
+  }
+
+  static presetsDir() {
+    return path.join(__dirname, 'presets');
+  }
+
+  static presetExists(presetName) {
+    if (!/^\w+$/.test(presetName)) return false;
+    return fs.existsSync(path.join(ClaudeRequest.presetsDir(), `${presetName}.json`));
+  }
+
+  static availablePresets() {
+    try {
+      return fs.readdirSync(ClaudeRequest.presetsDir())
+        .filter(name => name.endsWith('.json'))
+        .map(name => name.slice(0, -'.json'.length))
+        .sort();
+    } catch (error) {
+      Logger.warn(`Failed to list presets: ${error.message}`);
+      return [];
+    }
   }
 
   loadPreset(presetName) {
@@ -381,15 +408,29 @@ class ClaudeRequest {
     };
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+
       const req = https.request(options, (res) => {
+        settled = true;
         resolve(res);
+      });
+
+      // Without this a hung upstream held the client request open forever.
+      req.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+        Logger.error(`Upstream request idle for ${UPSTREAM_TIMEOUT_MS}ms, aborting`);
+        req.destroy(new Error(`Upstream request timeout after ${UPSTREAM_TIMEOUT_MS}ms`));
       });
 
       req.on('error', (err) => {
         req.destroy();
+        // Once the response is handed off, streamResponse owns the error path.
+        if (settled) {
+          Logger.error(`Upstream request error after response started: ${err.message}`);
+          return;
+        }
         reject(err);
       });
-      
+
       req.write(JSON.stringify(processedBody));
       req.end();
     });
@@ -411,9 +452,7 @@ class ClaudeRequest {
           res.statusCode = retryResponse.statusCode;
           Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
           Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
-          Object.keys(retryResponse.headers).forEach(key => {
-            res.setHeader(key, retryResponse.headers[key]);
-          });
+          this.copyResponseHeaders(res, retryResponse);
           this.streamResponse(res, retryResponse);
           return;
         } catch (error) {
@@ -426,10 +465,8 @@ class ClaudeRequest {
       res.statusCode = claudeResponse.statusCode;
       Logger.debug(`Claude API status: ${claudeResponse.statusCode}`);
       Logger.debug('Claude response headers:', JSON.stringify(claudeResponse.headers, null, 2));
-      Object.keys(claudeResponse.headers).forEach(key => {
-        res.setHeader(key, claudeResponse.headers[key]);
-      });
-      
+      this.copyResponseHeaders(res, claudeResponse);
+
       this.streamResponse(res, claudeResponse);
       
     } catch (error) {
@@ -437,6 +474,24 @@ class ClaudeRequest {
       res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
     }
+  }
+
+  // Never forward body-framing or hop-by-hop headers. The non-streaming path
+  // re-serializes the JSON, so upstream's content-length is not guaranteed to
+  // match what we actually send; Node sets the framing headers itself.
+  copyResponseHeaders(res, claudeResponse) {
+    const skipped = new Set([
+      'content-length',
+      'content-encoding',
+      'transfer-encoding',
+      'connection',
+      'keep-alive'
+    ]);
+
+    Object.keys(claudeResponse.headers).forEach(key => {
+      if (skipped.has(key.toLowerCase())) return;
+      res.setHeader(key, claudeResponse.headers[key]);
+    });
   }
 
   streamResponse(res, claudeResponse) {
@@ -507,8 +562,6 @@ class ClaudeRequest {
         });
       }
     } else {
-      res.removeHeader('content-encoding');
-
       let responseData = '';
       claudeResponse.on('data', chunk => {
         responseData += chunk;
@@ -526,13 +579,17 @@ class ClaudeRequest {
 
       claudeResponse.on('end', () => {
         Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 500)}`);
+        if (res.headersSent || res.destroyed) return;
+
         try {
-          const jsonData = JSON.parse(responseData);
+          const payload = JSON.stringify(JSON.parse(responseData));
           res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Content-Length', Buffer.byteLength(payload));
           Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
-          res.end(JSON.stringify(jsonData));
+          res.end(payload);
           Logger.debug('Non-streaming response sent back to client');
         } catch (e) {
+          res.setHeader('Content-Length', Buffer.byteLength(responseData));
           res.end(responseData);
           Logger.debug('Raw response sent back to client');
         }

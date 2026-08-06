@@ -4,6 +4,7 @@ port=42069
 host=
 log_level=INFO  # TRACE, DEBUG, INFO, WARN, ERROR
 filter_sampling_params=true  # Set to true to ensure only one sampling parameter is sent (required for Sonnet 4.5 compatibility). Removes default values (1.0) and prefers temperature over top_p when both are non-default.
+upstream_timeout_ms=300000  # Abort a request to api.anthropic.com after this many ms of socket inactivity. Streaming resets the timer.
 
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers

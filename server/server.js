@@ -22,8 +22,10 @@ function cleanupExpiredPKCE() {
   }
 }
 
-// Cleanup expired PKCE states every minute
-setInterval(cleanupExpiredPKCE, 60000);
+// Cleanup expired PKCE states every minute. unref'd so merely requiring this
+// module (tests, tooling) does not keep the event loop alive forever; the
+// listening server keeps the process up on its own.
+setInterval(cleanupExpiredPKCE, 60000).unref();
 
 function loadConfig() {
   try {
@@ -60,7 +62,10 @@ function parseBody(req) {
       try {
         resolve(body ? JSON.parse(body) : {});
       } catch (error) {
-        reject(new Error(`Invalid JSON: ${error.message}`));
+        // Malformed client input is a 400, not a server fault.
+        const badRequest = new Error(`Invalid JSON: ${error.message}`);
+        badRequest.statusCode = 400;
+        reject(badRequest);
       }
     });
     req.on('error', reject);
@@ -266,13 +271,26 @@ async function handleRequest(req, res) {
       const presetMatch = pathname.match(/^\/v1\/(\w+)\/messages$/);
       if (presetMatch) {
         presetName = presetMatch[1];
+
+        // A typo in the preset name used to be a silent 200 with no preset
+        // applied, so the client believed a preset was active when it was not.
+        if (!ClaudeRequest.presetExists(presetName)) {
+          Logger.warn(`Unknown preset: ${presetName}`);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            error: `Unknown preset: ${presetName}`,
+            available_presets: ClaudeRequest.availablePresets()
+          }));
+          return;
+        }
+
         Logger.debug(`Detected preset: ${presetName}`);
       }
-      
+
       await new ClaudeRequest(req).handleResponse(res, body, presetName);
     } catch (error) {
       Logger.error('Request error:', error.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
     }
     return;
