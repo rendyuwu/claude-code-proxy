@@ -334,11 +334,27 @@ class ClaudeRequest {
     return headers;
   }
 
+  // Deep copy so the caller's body is never mutated. The 401 retry path calls
+  // processRequestBody() a second time with the same body object, and in-place
+  // mutation made it inject the system prompt and preset suffix twice.
+  cloneBody(body) {
+    if (typeof structuredClone === 'function') {
+      try {
+        return structuredClone(body);
+      } catch (error) {
+        Logger.debug(`structuredClone failed, using JSON clone: ${error.message}`);
+      }
+    }
+    return JSON.parse(JSON.stringify(body));
+  }
+
   processRequestBody(body, presetName = null) {
     if (!body) return body;
 
+    let processed = this.cloneBody(body);
+
     // Skip system prompt injection for Haiku models
-    const isHaiku = body.model && body.model.toLowerCase().includes('haiku');
+    const isHaiku = processed.model && processed.model.toLowerCase().includes('haiku');
 
     if (!isHaiku) {
       const systemPrompt = {
@@ -346,27 +362,27 @@ class ClaudeRequest {
         text: 'You are Claude Code, Anthropic\'s official CLI for Claude.'
       };
 
-      if (body.system) {
-        if (Array.isArray(body.system)) {
-          body.system.unshift(systemPrompt);
+      if (processed.system) {
+        if (Array.isArray(processed.system)) {
+          processed.system.unshift(systemPrompt);
         } else {
-          body.system = [systemPrompt, { type: 'text', text: body.system }];
+          processed.system = [systemPrompt, { type: 'text', text: processed.system }];
         }
       } else {
-        body.system = [systemPrompt];
+        processed.system = [systemPrompt];
       }
     } else {
       Logger.debug('Skipping Claude Code system prompt for Haiku model');
     }
 
     if (presetName) {
-      this.applyPreset(body, presetName);
+      this.applyPreset(processed, presetName);
     }
 
-    body = this.stripTtlFromCacheControl(body);
-    body = this.filterSamplingParams(body);
+    processed = this.stripTtlFromCacheControl(processed);
+    processed = this.filterSamplingParams(processed);
 
-    return body;
+    return processed;
   }
 
   loadPreset(presetName) {
