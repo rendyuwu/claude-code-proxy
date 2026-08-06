@@ -41,7 +41,6 @@ const FILTER_SAMPLING_PARAMS = CONFIG.filter_sampling_params === true; // Defaul
 const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Default to true
 
 class ClaudeRequest {
-  static cachedToken = null;
   static presetCache = new Map();
   static refreshPromise = null;
 
@@ -50,11 +49,14 @@ class ClaudeRequest {
     this.VERSION = '2023-06-01';
     this.BETA_HEADER = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14';
 
+    // A client-supplied token belongs to this request only. It used to be
+    // written to a static cache, so one client's key was handed to every other
+    // client sharing the process.
+    this.headerToken = null;
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
-      Logger.debug('Using x-api-key as token, replacing cache');
-      const token = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
-      ClaudeRequest.cachedToken = token;
+      Logger.debug('Using x-api-key as token for this request');
+      this.headerToken = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
     }
 
     this.refreshToken = TOKEN_REFRESH_METHOD === 'OAUTH' ? this.refreshTokenWithOauth : this.refreshTokenWithClaudeCodeCli;
@@ -145,20 +147,27 @@ class ClaudeRequest {
   }
 
   async getAuthToken() {
-    if (ClaudeRequest.cachedToken) {
-      return ClaudeRequest.cachedToken;
+    if (this.headerToken) {
+      return this.headerToken;
     }
 
-    const token = await this.loadOrRefreshToken();
-    ClaudeRequest.cachedToken = token;
-    return token;
+    // No process-wide token cache: OAuthManager caches its own token and
+    // validates expiry against the token file, and the Claude Code fallback
+    // re-reads expiresAt on every call. A second cache here only added a way
+    // to serve an expired or foreign token.
+    return await this.loadOrRefreshToken();
   }
 
-  async loadOrRefreshToken() {
+  async loadOrRefreshToken({ force = false } = {}) {
     try {
       // Try OAuthManager's stored tokens first
       if (OAuthManager.isAuthenticated()) {
         Logger.debug('Using OAuthManager tokens');
+        if (force) {
+          Logger.info('Forcing OAuth token refresh');
+          const response = await OAuthManager.refreshAccessToken();
+          return `Bearer ${response.access_token}`;
+        }
         const token = await OAuthManager.getValidAccessToken();
         return `Bearer ${token}`;
       }
@@ -166,7 +175,7 @@ class ClaudeRequest {
       // Fallback to Claude Code credentials if enabled
       if (FALLBACK_TO_CLAUDE_CODE) {
         Logger.debug('Falling back to Claude Code credentials');
-        return await this.loadFromClaudeCodeCredentials();
+        return await this.loadFromClaudeCodeCredentials({ force });
       }
 
       throw new Error('No authentication tokens found. Please authenticate first.');
@@ -175,13 +184,17 @@ class ClaudeRequest {
     }
   }
 
-  async loadFromClaudeCodeCredentials() {
+  async loadFromClaudeCodeCredentials({ force = false } = {}) {
     try {
       const credentialsData = this.loadCredentialsFromFile();
       const credentials = JSON.parse(credentialsData);
       const oauth = credentials.claudeAiOauth;
 
-      if (oauth.expiresAt && Date.now() >= (oauth.expiresAt - 10000)) {
+      if (!oauth || !oauth.accessToken) {
+        throw new Error('no claudeAiOauth section in credentials file');
+      }
+
+      if (force || (oauth.expiresAt && Date.now() >= (oauth.expiresAt - 10000))) {
         Logger.info('Claude Code token expired/expiring, refreshing...');
         return await this.refreshToken();
       }
@@ -436,8 +449,8 @@ class ClaudeRequest {
     Logger.debug(`Applied preset: ${presetName}`);
   }
 
-  async makeRequest(body, presetName = null) {
-    const token = await this.getAuthToken();
+  async makeRequest(body, presetName = null, tokenOverride = null) {
+    const token = tokenOverride || await this.getAuthToken();
     const headers = this.getHeaders(token);
     const processedBody = this.processRequestBody(body, presetName);
 
@@ -472,14 +485,15 @@ class ClaudeRequest {
     try {
       const claudeResponse = await this.makeRequest(body, presetName);
       
-      if (claudeResponse.statusCode === 401) {
-        Logger.info('Got 401, checking credential store');
-        ClaudeRequest.cachedToken = null;
-        
+      // A 401 on a client-supplied x-api-key is the client's problem: do not
+      // silently retry it with the proxy owner's subscription credentials.
+      if (claudeResponse.statusCode === 401 && !this.headerToken) {
+        Logger.info('Got 401, forcing credential refresh and retrying once');
+
         try {
-          const newToken = await this.loadOrRefreshToken();
-          ClaudeRequest.cachedToken = newToken;
-          const retryResponse = await this.makeRequest(body, presetName);
+          const newToken = await this.loadOrRefreshToken({ force: true });
+          claudeResponse.destroy();
+          const retryResponse = await this.makeRequest(body, presetName, newToken);
           res.statusCode = retryResponse.statusCode;
           Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
           Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
@@ -489,8 +503,10 @@ class ClaudeRequest {
           this.streamResponse(res, retryResponse);
           return;
         } catch (error) {
-          Logger.info('Token load/refresh failed, passing 401 to client');
+          Logger.info(`Token load/refresh failed, passing 401 to client: ${error.message}`);
         }
+      } else if (claudeResponse.statusCode === 401) {
+        Logger.info('Got 401 for client-supplied x-api-key, passing it through');
       }
       
       res.statusCode = claudeResponse.statusCode;
