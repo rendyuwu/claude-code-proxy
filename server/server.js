@@ -261,6 +261,13 @@ async function handleRequest(req, res) {
     return;
   }
   
+  // Forwarded so clients can enumerate models instead of hardcoding a list.
+  if (pathname === '/v1/models' && req.method === 'GET') {
+    const search = parsedUrl.search || '';
+    await new ClaudeRequest(req).handleModels(res, search);
+    return;
+  }
+
   if (req.method === 'POST' && (pathname === '/v1/messages' || pathname.match(/^\/v1\/\w+\/messages$/))) {
     try {
       Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
@@ -313,25 +320,32 @@ function startServer() {
   server.listen(port, host, () => {
     Logger.info(`claude-code-proxy server listening on ${host}:${port}`);
 
-    // Display authentication status
-    const isAuthenticated = OAuthManager.isAuthenticated();
-    const expiration = OAuthManager.getTokenExpiration();
+    // Display authentication status, including the Claude Code fallback
+    const credentials = ClaudeRequest.describeCredentialSource();
+    const authUrl = `http://localhost:${port}/auth/login`;
+    const usable = credentials.source !== 'none' && !credentials.expired;
 
     Logger.info('');
     Logger.info('Authentication Status:');
-    if (isAuthenticated && expiration) {
-      Logger.info(`  ✓ Authenticated until ${expiration.toLocaleString()}`);
+    if (credentials.source === 'proxy') {
+      Logger.info(`  ✓ Authenticated with proxy OAuth tokens until ${credentials.expiresAt.toLocaleString()}`);
+    } else if (credentials.source === 'claude-code' && !credentials.expired) {
+      const until = credentials.expiresAt ? ` until ${credentials.expiresAt.toLocaleString()}` : '';
+      Logger.info(`  ✓ Using Claude Code credentials (read-only)${until}`);
+      Logger.info(`  → Run Claude Code to refresh them, or visit ${authUrl} to give the proxy its own tokens`);
+    } else if (credentials.source === 'claude-code') {
+      Logger.info('  ✗ Claude Code credentials found but expired');
+      Logger.info(`  → Run Claude Code once to refresh them, or visit ${authUrl} to authenticate the proxy`);
     } else {
       Logger.info('  ✗ Not authenticated');
-      const authUrl = `http://localhost:${port}/auth/login`;
       Logger.info(`  → Visit ${authUrl} to authenticate`);
+    }
 
-      // Auto-open browser if configured (only works when running natively)
-      const autoOpenBrowser = config.auto_open_browser !== 'false';
-      if (!isAuthenticated && autoOpenBrowser && !isRunningInDocker()) {
-        Logger.info('  → Opening browser for authentication...');
-        setTimeout(() => openBrowser(authUrl), 1000);
-      }
+    // Auto-open browser if configured (only works when running natively)
+    const autoOpenBrowser = config.auto_open_browser !== 'false';
+    if (!usable && autoOpenBrowser && !isRunningInDocker()) {
+      Logger.info('  → Opening browser for authentication...');
+      setTimeout(() => openBrowser(authUrl), 1000);
     }
     Logger.info('');
   });

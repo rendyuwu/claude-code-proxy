@@ -318,6 +318,34 @@ class ClaudeRequest {
     return processed;
   }
 
+  // Startup used to report "Not authenticated" whenever the proxy had no
+  // tokens.json of its own, even though every request succeeded through the
+  // Claude Code fallback. Report what will actually be used.
+  static describeCredentialSource() {
+    if (OAuthManager.isAuthenticated()) {
+      return { source: 'proxy', expiresAt: OAuthManager.getTokenExpiration(), expired: false };
+    }
+
+    if (!FALLBACK_TO_CLAUDE_CODE) {
+      return { source: 'none' };
+    }
+
+    try {
+      const credentials = JSON.parse(new ClaudeRequest().loadCredentialsFromFile());
+      const oauth = credentials.claudeAiOauth;
+      if (!oauth || !oauth.accessToken) {
+        return { source: 'none' };
+      }
+      return {
+        source: 'claude-code',
+        expiresAt: oauth.expiresAt ? new Date(oauth.expiresAt) : null,
+        expired: !!(oauth.expiresAt && Date.now() >= (oauth.expiresAt - 10000))
+      };
+    } catch (error) {
+      return { source: 'none' };
+    }
+  }
+
   static presetsDir() {
     return path.join(__dirname, 'presets');
   }
@@ -407,6 +435,28 @@ class ClaudeRequest {
       headers: headers
     };
 
+    return this.sendUpstream(options, JSON.stringify(processedBody));
+  }
+
+  async makeGetRequest(pathWithQuery, tokenOverride = null) {
+    const token = tokenOverride || await this.getAuthToken();
+    const headers = this.getHeaders(token);
+    delete headers['Content-Type'];
+
+    const urlParts = new URL(this.API_URL);
+    const options = {
+      hostname: urlParts.hostname,
+      port: urlParts.port || 443,
+      path: pathWithQuery,
+      method: 'GET',
+      headers: headers
+    };
+
+    Logger.debug(`Upstream GET ${pathWithQuery}`);
+    return this.sendUpstream(options);
+  }
+
+  sendUpstream(options, payload = null) {
     return new Promise((resolve, reject) => {
       let settled = false;
 
@@ -431,15 +481,27 @@ class ClaudeRequest {
         reject(err);
       });
 
-      req.write(JSON.stringify(processedBody));
+      if (payload !== null) {
+        req.write(payload);
+      }
       req.end();
     });
   }
 
   async handleResponse(res, body, presetName = null) {
+    return this.proxyUpstream(res, (token) => this.makeRequest(body, presetName, token));
+  }
+
+  async handleModels(res, search = '') {
+    return this.proxyUpstream(res, (token) => this.makeGetRequest(`/v1/models${search}`, token));
+  }
+
+  // Single place that owns the 401-retry, header copy and body forwarding for
+  // every upstream call. send(token) receives null on the first attempt.
+  async proxyUpstream(res, send) {
     try {
-      const claudeResponse = await this.makeRequest(body, presetName);
-      
+      const claudeResponse = await send(null);
+
       // A 401 on a client-supplied x-api-key is the client's problem: do not
       // silently retry it with the proxy owner's subscription credentials.
       if (claudeResponse.statusCode === 401 && !this.headerToken) {
@@ -448,7 +510,7 @@ class ClaudeRequest {
         try {
           const newToken = await this.loadOrRefreshToken({ force: true });
           claudeResponse.destroy();
-          const retryResponse = await this.makeRequest(body, presetName, newToken);
+          const retryResponse = await send(newToken);
           res.statusCode = retryResponse.statusCode;
           Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
           Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
@@ -461,14 +523,14 @@ class ClaudeRequest {
       } else if (claudeResponse.statusCode === 401) {
         Logger.info('Got 401 for client-supplied x-api-key, passing it through');
       }
-      
+
       res.statusCode = claudeResponse.statusCode;
       Logger.debug(`Claude API status: ${claudeResponse.statusCode}`);
       Logger.debug('Claude response headers:', JSON.stringify(claudeResponse.headers, null, 2));
       this.copyResponseHeaders(res, claudeResponse);
 
       this.streamResponse(res, claudeResponse);
-      
+
     } catch (error) {
       Logger.error('Claude request error:', error.message);
       res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
