@@ -28,6 +28,7 @@ Requires:
 If you already have Claude Code installed and prefer to use its credentials:
 - The proxy will automatically fall back to Claude Code credentials if no OAuth tokens are found
 - Set `fallback_to_claude_code=true` in `server/config.txt` (default)
+- This fallback is **read-only**: the proxy reads `~/.claude/.credentials.json` and never writes to it. Anthropic rotates the refresh token on every refresh, so a proxy-side refresh would invalidate the token Claude Code still holds in that same file. When the access token expires, the proxy answers 401 and asks you to run Claude Code once (which refreshes its own token) or to authenticate the proxy at `/auth/login`. Option 1 avoids this entirely
 
 ### Docker startup
 1. `docker-compose up`
@@ -35,7 +36,7 @@ If you already have Claude Code installed and prefer to use its credentials:
 
 **Important Notes:**
 - NOT an OpenAI compatible proxy, uses Anthropic's schema
-- Only exact dated model names of Sonnet 4, 3.7, 3.6, and Haiku 3.5 are allowed. Opus 4 too with Max.
+- Which models you can use depends on your account. Ask the proxy instead of guessing: `GET http://localhost:42069/v1/models` forwards the request upstream and returns the list your credentials are actually allowed to use. As of 2026-08-06 a Max account returns `claude-opus-5`, `claude-sonnet-5`, `claude-fable-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-sonnet-4-6`, `claude-opus-4-6`, `claude-opus-4-5-20251101`, `claude-haiku-4-5-20251001` and `claude-sonnet-4-5-20250929`. Undated aliases such as `claude-haiku-4-5`, `claude-opus-4-5` and `claude-sonnet-4-5` work too; models your account has no access to come back as a 404 from Anthropic, forwarded as-is
 - Understand your front end's caching, some FEs like ST disable by default, complex RP setups may consistently miss cache and increase costs
 
 ## Authentication
@@ -59,18 +60,20 @@ The proxy now supports **standalone OAuth authentication** - no Claude Code inst
 auto_open_browser=true           # Automatically open browser on first run
 fallback_to_claude_code=true     # Use Claude Code credentials as fallback
 host=                            # Leave blank for auto-detect (127.0.0.1 native, 0.0.0.0 Docker)
+upstream_timeout_ms=300000       # Abort a request to api.anthropic.com after this much socket inactivity
 ```
 
 **Token Priority:**
-1. `x-api-key` header (if provided in requests)
-2. OAuth tokens from `~/.claude-code-proxy/tokens.json`
-3. Claude Code credentials from `~/.claude/.credentials.json` (if fallback enabled)
+1. `x-api-key` header (if provided in requests) - used for that request only, never cached for other clients. If Anthropic rejects it, you get the 401 back instead of the proxy quietly falling back to its own credentials
+2. OAuth tokens from `~/.claude-code-proxy/tokens.json` - refreshed automatically
+3. Claude Code credentials from `~/.claude/.credentials.json` (if fallback enabled) - read-only, never refreshed by the proxy
 
 ### Claude Code Credentials (Legacy Fallback)
 
 If you have Claude Code installed, the proxy can use its credentials as a fallback:
 - Automatically used if OAuth tokens don't exist and `fallback_to_claude_code=true`
 - Requires Claude Code to be installed and logged in
+- Read-only: the proxy never refreshes or rewrites `~/.claude/.credentials.json`. An expired token there is a 401 telling you to run Claude Code or to authenticate the proxy separately
 - See the "Beginner/Thorough Guide" section below for Claude Code setup instructions
 
 ## Beginner/Thorough Guide
@@ -110,7 +113,7 @@ You're done!
 
 - URL = `http://localhost:42069/v1`
 - Literally anything for password, just don't leave blank. As a backup option, you may put your oauth access token here (see Troubleshooting section)
-- You have to pick a specific name for the model, can't pick "latest". Have to have a date at the end. Only Sonnet (20241022 or later) and 3.5 Haiku are allowed plus Opus with Max. 
+- You have to pick a specific model name, "latest" won't work. Open `http://localhost:42069/v1/models` in a browser to see exactly which names your account accepts. 
 - Save the preset as "Claude Code Proxy" or whatever you want.
 - Click "Connect"
 
@@ -141,19 +144,22 @@ Most likely thing to go wrong is not being able to find the credentials, either 
 - Make sure your wsl default is Ubuntu (the default distro that comes with wsl)
 - If all else fails, go to wsl, `cat ~/.claude/.credentials.json`, copy out the access token (after sending a message from Claude Code first to make sure it's not expired), and put it in the authentication header. In ST, this is the Proxy "password".
   - If that's one too steps, you can go to util folder, enter wsl in the address bar, and run `claude-bearer.js` - that'll make sure it's not expired, and you'll get the token delivered to you. You don't have to copy "Bearer"
-- If you tend to leave Claude Code open for hours, you may find yourself logged out. This means the access token expired and this proxy renewed it, but Claude Code just sits there upset that it's expired instead of just checking the file. Just close Claude Code, it'll be fine when you open it again.
+- The proxy no longer renews Claude Code's token for you (it used to, which could log Claude Code out). If the proxy starts returning 401 with "Claude Code access token expired", send one message from Claude Code so it refreshes the file, or authenticate the proxy on its own at `/auth/login`.
 
 ## What This Does
 
 ### Authentication
 - **OAuth Flow**: Implements PKCE OAuth 2.0 flow to authenticate directly with claude.ai
-- **Token Management**: Automatically refreshes access tokens when they expire
-- **Fallback Support**: Can optionally use Claude Code credentials as a fallback
+- **Token Management**: Automatically refreshes its own OAuth tokens (`~/.claude-code-proxy/tokens.json`) when they expire
+- **Fallback Support**: Can optionally read Claude Code credentials as a fallback, without ever writing to that file
 
 ### Request Processing
 - Adds headers (Authorization plus a couple specified in config.txt) to trick the endpoint into thinking the request is coming from a real Claude Code application
 - Remove "ttl" key from any "cache_control" objects, since endpoint does not allow it
 - The first section of the system prompt must be "You are Claude Code, Anthropic's official CLI for Claude." or the request will not be accepted by Anthropic (specifically/technically, it must be the first item of the "system" array's "text" content). I am adding this, but this is just FYI so you know it's there and that you have to deal with it
+- `GET /v1/models` is forwarded upstream so your front end can enumerate the models your account may use, instead of you hardcoding a list
+- A preset path with a name that doesn't exist (`/v1/typo/messages`) returns 400 with the list of real presets, rather than quietly sending the request with no preset applied
+- A request to Anthropic is aborted after `upstream_timeout_ms` of socket inactivity (default 300000). Streaming resets the timer, so only a genuinely stalled upstream trips it
 - Optionally filter sampling parameters to avoid conflicts with Sonnet 4.5. Set `filter_sampling_params=true` in `server/config.txt` to enable this feature, which ensures only one sampling parameter is sent to the API. When both `temperature` and `top_p` are specified, it removes whichever is at the default value (1.0), or prefers temperature if both are non-default (Sonnet 4.5 doesn't allow both parameters). Other models work fine with both parameters, so this defaults to off
 
 ### Smart Host Binding
