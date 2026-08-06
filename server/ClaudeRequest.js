@@ -7,7 +7,6 @@ const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 
 const STRIP_TTL = true;
-const TOKEN_REFRESH_METHOD = 'OAUTH'; // 'OAUTH' or 'CLAUDE_CODE_CLI'
 
 // Load configuration
 const loadConfig = () => {
@@ -42,7 +41,6 @@ const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Def
 
 class ClaudeRequest {
   static presetCache = new Map();
-  static refreshPromise = null;
 
   constructor(req = null) {
     this.API_URL = 'https://api.anthropic.com/v1/messages';
@@ -58,8 +56,6 @@ class ClaudeRequest {
       Logger.debug('Using x-api-key as token for this request');
       this.headerToken = apiKey.startsWith('Bearer ') ? apiKey : `Bearer ${apiKey}`;
     }
-
-    this.refreshToken = TOKEN_REFRESH_METHOD === 'OAUTH' ? this.refreshTokenWithOauth : this.refreshTokenWithClaudeCodeCli;
   }
 
   stripTtlFromCacheControl(body) {
@@ -158,6 +154,15 @@ class ClaudeRequest {
     return await this.loadOrRefreshToken();
   }
 
+  // 401, not 500: a missing or expired credential is the caller's problem to
+  // act on. userFacing keeps the message from being wrapped again on the way out.
+  authError(message) {
+    const error = new Error(message);
+    error.statusCode = 401;
+    error.userFacing = true;
+    return error;
+  }
+
   async loadOrRefreshToken({ force = false } = {}) {
     try {
       // Try OAuthManager's stored tokens first
@@ -178,9 +183,10 @@ class ClaudeRequest {
         return await this.loadFromClaudeCodeCredentials({ force });
       }
 
-      throw new Error('No authentication tokens found. Please authenticate first.');
+      throw this.authError('No authentication tokens found. Please authenticate first.');
     } catch (error) {
-      throw new Error(`Failed to get auth token: ${error.message}`);
+      if (error.userFacing) throw error;
+      throw this.authError(`Failed to get auth token: ${error.message}`);
     }
   }
 
@@ -194,14 +200,27 @@ class ClaudeRequest {
         throw new Error('no claudeAiOauth section in credentials file');
       }
 
+      // Read-only by design. Anthropic rotates the refresh token on every
+      // refresh, so refreshing here would invalidate the token Claude Code
+      // still holds in this same file and break the user's Claude Code login.
       if (force || (oauth.expiresAt && Date.now() >= (oauth.expiresAt - 10000))) {
-        Logger.info('Claude Code token expired/expiring, refreshing...');
-        return await this.refreshToken();
+        throw this.authError(
+          'Claude Code access token expired. Run Claude Code once so it refreshes its own token, ' +
+          'or authenticate the proxy separately at /auth/login'
+        );
       }
 
       return `Bearer ${oauth.accessToken}`;
     } catch (error) {
-      throw new Error(`Failed to load Claude Code credentials: ${error.message}`);
+      if (error.userFacing) throw error;
+      if (error.code === 'ENOENT') {
+        throw this.authError(
+          process.platform === 'win32'
+            ? 'Claude credentials file not found in WSL. Check your default WSL distro with "wsl -l -v" and set the correct one with "wsl --set-default <distro-name>". As a backup, you can get the token from ~/.claude/.credentials.json and pass it as x-api-key (proxy password in SillyTavern)'
+            : 'Claude credentials not found. Please ensure Claude Code is installed and you have logged in. As a backup, you can get the token from ~/.claude/.credentials.json and pass it as x-api-key (proxy password in SillyTavern)'
+        );
+      }
+      throw this.authError(`Failed to load Claude Code credentials: ${error.message}`);
     }
   }
 
@@ -218,117 +237,6 @@ class ClaudeRequest {
       // macOS/Linux use the same path convention
       const credentialsPath = path.join(os.homedir(), '.claude', '.credentials.json');
       return fs.readFileSync(credentialsPath, 'utf8');
-    }
-  }
-
-  writeCredentialsToFile(credentialsJson) {
-    if (process.platform === 'win32') {
-      // Write to native Windows location if it exists, otherwise use WSL
-      const nativePath = path.join(os.homedir(), '.claude', '.credentials.json');
-      if (fs.existsSync(nativePath)) {
-        fs.writeFileSync(nativePath, credentialsJson, 'utf8');
-      } else {
-        execSync(`wsl tee ~/.claude/.credentials.json`, { input: credentialsJson, encoding: 'utf8', timeout: 10000 });
-      }
-    } else {
-      const credentialsPath = path.join(os.homedir(), '.claude', '.credentials.json');
-      fs.writeFileSync(credentialsPath, credentialsJson, 'utf8');
-    }
-  }
-
-
-  async refreshTokenWithOauth() {
-    // Race condition protection
-    if (ClaudeRequest.refreshPromise) {
-      return await ClaudeRequest.refreshPromise;
-    }
-    
-    ClaudeRequest.refreshPromise = this._doRefresh();
-    try {
-      const result = await ClaudeRequest.refreshPromise;
-      return result;
-    } finally {
-      ClaudeRequest.refreshPromise = null;
-    }
-  }
-
-  async _doRefresh() {
-    try {
-      const credentialsData = this.loadCredentialsFromFile();
-      const credentials = JSON.parse(credentialsData);
-      const refreshToken = credentials.claudeAiOauth?.refreshToken;
-
-      const refreshData = {
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-      };
-
-      const options = {
-        hostname: 'console.anthropic.com',
-        port: 443,
-        path: '/v1/oauth/token',
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json, text/plain, */*',
-          'User-Agent': 'claude-code-proxy/1.0.0'
-        }
-      };
-
-      const response = await new Promise((resolve, reject) => {
-        const req = https.request(options, (res) => {
-          let responseData = '';
-          res.on('data', chunk => responseData += chunk);
-          res.on('end', () => {
-            try {
-              const response = JSON.parse(responseData);
-              if (res.statusCode === 200) {
-                resolve(response);
-              } else {
-                reject(new Error(`OAuth request failed: ${response.error || responseData}`));
-              }
-            } catch (error) {
-              reject(new Error(`Invalid JSON response: ${responseData}`));
-            }
-          });
-        });
-
-        req.setTimeout(10000, () => {
-          req.destroy();
-          reject(new Error('OAuth request timeout'));
-        });
-
-        req.on('error', reject);
-        req.write(JSON.stringify(refreshData));
-        req.end();
-      });
-      
-      credentials.claudeAiOauth.accessToken = response.access_token;
-      credentials.claudeAiOauth.refreshToken = response.refresh_token;
-      credentials.claudeAiOauth.expiresAt = Date.now() + (response.expires_in * 1000);
-      
-      const credentialsJson = JSON.stringify(credentials);
-      this.writeCredentialsToFile(credentialsJson);
-      
-      Logger.info('Token refreshed successfully');
-      return `Bearer ${response.access_token}`;
-      
-    } catch (error) {
-      if (error.code === 'ENOENT') {
-        const errorMsg = process.platform === 'win32' 
-          ? 'Failed to load credentials: Claude credentials file not found in WSL. Check your default WSL distro with "wsl -l -v" and set the correct one with "wsl --set-default <distro-name>". As a backup, you can get the token from ~/.claude/.credentials.json and pass it as x-api-key (proxy password in SillyTavern)'
-          : 'Claude credentials not found. Please ensure Claude Code is installed and you have logged in. As a backup, you can get the token from ~/.claude/.credentials.json and pass it as x-api-key (proxy password in SillyTavern)';
-        Logger.error('ENOENT error during token refresh:', errorMsg);
-        throw new Error(errorMsg);
-      }
-      if (error.message.includes('invalid_grant')) {
-        throw new Error('Refresh token expired. Please log in again through Claude Code');
-      }
-      if (error.message.includes('timeout')) {
-        throw new Error('Token refresh timeout. Please check your internet connection');
-      }
-      throw new Error(`Token refresh failed: ${error.message}`);
     }
   }
 
@@ -525,8 +433,8 @@ class ClaudeRequest {
       this.streamResponse(res, claudeResponse);
       
     } catch (error) {
-      console.error('Claude request error:', error.message);
-      res.writeHead(500, { 'Content-Type': 'application/json' });
+      Logger.error('Claude request error:', error.message);
+      res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: error.message }));
     }
   }
@@ -630,10 +538,6 @@ class ClaudeRequest {
         }
       });
     }
-  }
-
-  async refreshTokenWithClaudeCodeCli() {
-    throw new Error('CLI token refresh not implemented');
   }
 }
 
