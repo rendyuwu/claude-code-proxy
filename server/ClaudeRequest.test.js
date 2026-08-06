@@ -138,6 +138,88 @@ describe('processRequestBody', () => {
   });
 });
 
+describe('prompt caching', () => {
+  const withTtl = () => ({
+    model: SONNET,
+    tools: [{ name: 't', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    system: [{ type: 'text', text: 'be terse', cache_control: { type: 'ephemeral', ttl: '1h' } }],
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral', ttl: '1h' } }] }]
+  });
+
+  it('keeps cache_control.ttl by default so a 1h breakpoint is not downgraded to 5m', () => {
+    const processed = new ClaudeRequest().processRequestBody(withTtl());
+
+    expect(processed.tools[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(processed.system[1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(processed.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+  });
+
+  it('strips ttl and scope from every cache_control site, tools included, when asked', () => {
+    const body = withTtl();
+    body.system[0].cache_control.scope = 'organization';
+
+    const stripped = new ClaudeRequest().stripTtlFromCacheControl(body);
+
+    expect(stripped.tools[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(stripped.system[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(stripped.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('hands the trailing system breakpoint to the preset block so the preset is cached', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: SONNET,
+      system: [{ type: 'text', text: 'be terse', cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: 'hi' }]
+    }, 'pyrite');
+
+    const last = processed.system[processed.system.length - 1];
+    expect(processed.system).toHaveLength(3); // Claude Code, client, preset
+    expect(last.text).not.toBe('be terse');
+    expect(last.cache_control).toEqual({ type: 'ephemeral' });
+    expect(processed.system[1].cache_control).toBeUndefined();
+  });
+
+  it('hands the trailing message breakpoint to the injected suffix turn', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: SONNET,
+      messages: [
+        { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+        { role: 'assistant', content: 'hello' },
+        { role: 'user', content: [{ type: 'text', text: 'again', cache_control: { type: 'ephemeral' } }] }
+      ]
+    }, 'pyrite');
+
+    const suffix = processed.messages[3];
+    expect(suffix.role).toBe('user');
+    expect(suffix.content[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(processed.messages[2].content[0].cache_control).toBeUndefined();
+  });
+
+  it('does not invent a breakpoint when the client set none', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: SONNET,
+      system: [{ type: 'text', text: 'be terse' }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }]
+    }, 'pyrite');
+
+    const blocks = [...processed.system, ...processed.messages.flatMap(m => m.content)];
+    expect(blocks.every(block => block.cache_control === undefined)).toBe(true);
+  });
+
+  it('still produces an identical payload on the 401 retry path', () => {
+    const claudeRequest = new ClaudeRequest();
+    const body = {
+      model: SONNET,
+      system: [{ type: 'text', text: 'be terse', cache_control: { type: 'ephemeral' } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi', cache_control: { type: 'ephemeral' } }] }]
+    };
+
+    expect(claudeRequest.processRequestBody(body, 'pyrite'))
+      .toEqual(claudeRequest.processRequestBody(body, 'pyrite'));
+    expect(body.system[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+});
+
 describe('token handling', () => {
   it('keeps an x-api-key token on the instance instead of a shared cache', async () => {
     const withKey = new ClaudeRequest({ headers: { 'x-api-key': 'sk-ant-oat01-CLIENT-A' } });
