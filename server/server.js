@@ -365,4 +365,4 @@ if (require.main === module) {
   startServer();
 }
 
-module.exports = { startServer, ClaudeRequest };
+module.exports = { startServer, handleRequest, ClaudeRequest };
