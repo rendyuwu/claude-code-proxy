@@ -361,6 +361,15 @@ class ClaudeRequest {
     return JSON.parse(JSON.stringify(body));
   }
 
+  // Anthropic accepts system as a string or as a content-block array. Everything
+  // downstream (system prompt injection, applyPreset) works on the array form,
+  // so normalize once here.
+  normalizeSystem(system) {
+    if (!system) return [];
+    if (Array.isArray(system)) return system;
+    return [{ type: 'text', text: system }];
+  }
+
   processRequestBody(body, presetName = null) {
     if (!body) return body;
 
@@ -369,27 +378,24 @@ class ClaudeRequest {
     // Skip system prompt injection for Haiku models
     const isHaiku = processed.model && processed.model.toLowerCase().includes('haiku');
 
+    processed.system = this.normalizeSystem(processed.system);
+
     if (!isHaiku) {
-      const systemPrompt = {
+      processed.system.unshift({
         type: 'text',
         text: 'You are Claude Code, Anthropic\'s official CLI for Claude.'
-      };
-
-      if (processed.system) {
-        if (Array.isArray(processed.system)) {
-          processed.system.unshift(systemPrompt);
-        } else {
-          processed.system = [systemPrompt, { type: 'text', text: processed.system }];
-        }
-      } else {
-        processed.system = [systemPrompt];
-      }
+      });
     } else {
       Logger.debug('Skipping Claude Code system prompt for Haiku model');
     }
 
     if (presetName) {
       this.applyPreset(processed, presetName);
+    }
+
+    // Never send an empty system array upstream.
+    if (processed.system.length === 0) {
+      delete processed.system;
     }
 
     processed = this.stripTtlFromCacheControl(processed);
