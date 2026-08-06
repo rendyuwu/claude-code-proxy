@@ -6,8 +6,6 @@ const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 
-const STRIP_TTL = true;
-
 // Load configuration
 const loadConfig = () => {
   try {
@@ -38,6 +36,11 @@ const loadConfig = () => {
 const CONFIG = loadConfig();
 const FILTER_SAMPLING_PARAMS = CONFIG.filter_sampling_params === true; // Default to false
 const FALLBACK_TO_CLAUDE_CODE = CONFIG.fallback_to_claude_code !== false; // Default to true
+// api.anthropic.com accepts cache_control.ttl on the Claude Code OAuth path,
+// verified against a live 1h breakpoint. Stripping it silently downgraded every
+// 1h request to the 5m default, so the strip is opt-in for the case where a
+// future upstream change starts rejecting the field again.
+const STRIP_CACHE_CONTROL_TTL = CONFIG.strip_cache_control_ttl === true; // Default to false
 // Socket inactivity timeout, not a total deadline: streaming responses keep
 // resetting it, so only a genuinely stalled upstream trips it.
 const UPSTREAM_TIMEOUT_MS = parseInt(CONFIG.upstream_timeout_ms, 10) || 300000;
@@ -61,8 +64,10 @@ class ClaudeRequest {
     }
   }
 
+  // Unconditional; the caller decides whether to run it. Every place a
+  // cache_control object can appear is covered: tools used to be skipped, so a
+  // request could end up with a 1h breakpoint on tools and a 5m one on system.
   stripTtlFromCacheControl(body) {
-    if (!STRIP_TTL) return body;
     if (!body || typeof body !== 'object') return body;
 
     const processContentArray = (contentArray) => {
@@ -82,9 +87,8 @@ class ClaudeRequest {
       });
     };
 
-    if (Array.isArray(body.system)) {
-      processContentArray(body.system);
-    }
+    processContentArray(body.tools);
+    processContentArray(body.system);
 
     if (Array.isArray(body.messages)) {
       body.messages.forEach(message => {
@@ -312,7 +316,9 @@ class ClaudeRequest {
       delete processed.system;
     }
 
-    processed = this.stripTtlFromCacheControl(processed);
+    if (STRIP_CACHE_CONTROL_TTL) {
+      processed = this.stripTtlFromCacheControl(processed);
+    }
     processed = this.filterSamplingParams(processed);
 
     return processed;
@@ -385,6 +391,20 @@ class ClaudeRequest {
     }
   }
 
+  // A cache_control breakpoint marks the end of the cached prefix, so anything
+  // appended after it is re-billed at full price on every request. Injected
+  // preset text is byte-identical each time, so it belongs inside the prefix:
+  // hand the client's trailing breakpoint to the injected block instead of
+  // adding a new one. The breakpoint count is unchanged (the API allows 4) and
+  // the client's own content stays inside the prefix either way.
+  moveTrailingBreakpoint(fromBlock, toBlock) {
+    if (!fromBlock || !toBlock || !fromBlock.cache_control) return;
+
+    toBlock.cache_control = fromBlock.cache_control;
+    delete fromBlock.cache_control;
+    Logger.debug('Moved cache_control breakpoint onto injected preset block');
+  }
+
   applyPreset(body, presetName) {
     const preset = this.loadPreset(presetName);
     if (!preset) {
@@ -397,21 +417,29 @@ class ClaudeRequest {
         type: 'text',
         text: preset.system
       };
+      const previousLast = body.system[body.system.length - 1];
       body.system.push(presetSystemPrompt);
+      this.moveTrailingBreakpoint(previousLast, presetSystemPrompt);
     }
 
     // Use suffixEt only when thinking is enabled, otherwise use regular suffix
     const hasThinking = body.thinking && body.thinking.type === 'enabled';
     const suffix = hasThinking ? preset.suffixEt : preset.suffix;
-    
+
     if (suffix && body.messages && body.messages.length > 0) {
       const lastUserIndex = body.messages.map(m => m.role).lastIndexOf('user');
       if (lastUserIndex !== -1) {
-        const suffixMsg = {
+        const suffixBlock = { type: 'text', text: suffix };
+        body.messages.splice(lastUserIndex + 1, 0, {
           role: 'user',
-          content: [{ type: 'text', text: suffix }]
-        };
-        body.messages.splice(lastUserIndex + 1, 0, suffixMsg);
+          content: [suffixBlock]
+        });
+
+        // Only an array content can carry a breakpoint; a plain string cannot.
+        const lastUserContent = body.messages[lastUserIndex].content;
+        if (Array.isArray(lastUserContent) && lastUserContent.length > 0) {
+          this.moveTrailingBreakpoint(lastUserContent[lastUserContent.length - 1], suffixBlock);
+        }
       }
     }
 
