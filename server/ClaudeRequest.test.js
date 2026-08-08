@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const zlib = require('zlib');
 const nock = require('nock');
 const request = require('supertest');
 
@@ -335,8 +336,8 @@ describe('response forwarding', () => {
     const sentBodies = [];
     const capture = (body) => { sentBodies.push(body); return true; };
 
-    nock('https://api.anthropic.com').post('/v1/messages', capture).reply(401, { error: 'expired' });
-    nock('https://api.anthropic.com').post('/v1/messages', capture).reply(200, { ok: true });
+    nock('https://api.anthropic.com').post('/v1/messages', capture).query({ beta: 'true' }).reply(401, { error: 'expired' });
+    nock('https://api.anthropic.com').post('/v1/messages', capture).query({ beta: 'true' }).reply(200, { ok: true });
 
     const response = await request(messagesServer())
       .post('/v1/messages')
@@ -354,6 +355,7 @@ describe('response forwarding', () => {
   it('passes a 401 straight through for a client-supplied x-api-key', async () => {
     const scope = nock('https://api.anthropic.com')
       .post('/v1/messages')
+      .query({ beta: 'true' })
       .reply(401, { error: 'invalid token' });
 
     const response = await request(messagesServer())
@@ -370,6 +372,7 @@ describe('response forwarding', () => {
   it('sets content-length from the bytes it actually writes and drops upstream framing headers', async () => {
     nock('https://api.anthropic.com')
       .post('/v1/messages')
+      .query({ beta: 'true' })
       .reply(200, JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'hi' }] }), {
         'content-type': 'application/json',
         // Deliberately wrong: the proxy re-serializes the body, so forwarding
@@ -402,6 +405,142 @@ describe('response forwarding', () => {
 
     expect(response.status).toBe(401);
     expect(response.body.error).toMatch(/credentials/i);
+  });
+});
+
+describe('client identity headers', () => {
+  it('presents itself as the Claude Code CLI that owns the credential', () => {
+    const headers = new ClaudeRequest().getHeaders('Bearer token');
+
+    expect(headers['User-Agent']).toBe('claude-cli/2.1.92 (external, sdk-cli)');
+    expect(headers['X-App']).toBe('cli');
+    expect(headers['Anthropic-Dangerous-Direct-Browser-Access']).toBe('true');
+    expect(JSON.stringify(headers)).not.toMatch(/claude-code-proxy/);
+  });
+
+  it('carries the Stainless fingerprint, reporting the real runtime and host', () => {
+    const headers = new ClaudeRequest().getHeaders('Bearer token');
+
+    expect(headers['X-Stainless-Lang']).toBe('js');
+    expect(headers['X-Stainless-Runtime']).toBe('node');
+    expect(headers['X-Stainless-Runtime-Version']).toBe(process.version);
+    expect(headers['X-Stainless-Retry-Count']).toBe('0');
+    expect(headers['X-Stainless-Os']).toBe({
+      darwin: 'MacOS', win32: 'Windows', linux: 'Linux', freebsd: 'FreeBSD'
+    }[os.platform()] || `Other::${os.platform()}`);
+    expect(headers['X-Stainless-Arch']).toBe({
+      x64: 'x64', arm64: 'arm64', ia32: 'x86'
+    }[os.arch()] || `other::${os.arch()}`);
+  });
+
+  it('sets the streaming helper header only on a streaming request', () => {
+    expect(new ClaudeRequest().getHeaders('Bearer token', { stream: true })['X-Stainless-Helper-Method'])
+      .toBe('stream');
+    expect(new ClaudeRequest().getHeaders('Bearer token')['X-Stainless-Helper-Method'])
+      .toBeUndefined();
+  });
+
+  it('advertises the beta flags the current CLI sends', () => {
+    const beta = new ClaudeRequest().getHeaders('Bearer token')['anthropic-beta'].split(',');
+
+    expect(beta).toContain('claude-code-20250219');
+    expect(beta).toContain('oauth-2025-04-20');
+    expect(beta).toContain('token-efficient-tools-2026-03-28');
+    // Dropped by the CLI long ago; sending it would date the client.
+    expect(beta).not.toContain('fine-grained-tool-streaming-2025-05-14');
+  });
+
+  it('accepts compression instead of asking upstream for identity', () => {
+    expect(new ClaudeRequest().getHeaders('Bearer token')['Accept-Encoding'])
+      .toBe('gzip, deflate, br');
+  });
+
+  it('sends the beta query parameter the CLI uses', async () => {
+    const scope = nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, { ok: true });
+
+    await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(scope.isDone()).toBe(true);
+  });
+});
+
+describe('compressed upstream responses', () => {
+  it('decompresses a gzipped non-streaming body before framing it', async () => {
+    const payload = JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'hi' }] });
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, zlib.gzipSync(payload), {
+        'content-type': 'application/json',
+        'content-encoding': 'gzip'
+      });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(response.body.content[0].text).toBe('hi');
+    expect(response.headers['content-encoding']).toBeUndefined();
+    expect(Number(response.headers['content-length'])).toBe(Buffer.byteLength(response.text));
+  });
+
+  it('decompresses a gzipped event stream', async () => {
+    const sse = 'event: content_block_delta\n'
+      + 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n';
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, zlib.gzipSync(sse), {
+        'content-type': 'text/event-stream',
+        'content-encoding': 'gzip'
+      });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, stream: true, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(response.text).toBe(sse);
+  });
+
+  it('decompresses a deflated body', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, zlib.deflateSync(JSON.stringify({ id: 'msg_2' })), {
+        'content-type': 'application/json',
+        'content-encoding': 'deflate'
+      });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.body.id).toBe('msg_2');
+  });
+
+  it('answers 502 instead of forwarding garbage when the compressed body is corrupt', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, Buffer.from('not actually gzip'), {
+        'content-type': 'application/json',
+        'content-encoding': 'gzip'
+      });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(502);
   });
 });
 

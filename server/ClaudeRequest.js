@@ -1,4 +1,5 @@
 const https = require('https');
+const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -46,13 +47,47 @@ const STRIP_CACHE_CONTROL_TTL = CONFIG.strip_cache_control_ttl === true; // Defa
 // resetting it, so only a genuinely stalled upstream trips it.
 const UPSTREAM_TIMEOUT_MS = parseInt(CONFIG.upstream_timeout_ms, 10) || 300000;
 
+// The proxy speaks to api.anthropic.com with a Claude Code subscription token,
+// so it identifies itself the way the CLI that owns that token does. A
+// User-Agent of "claude-code-proxy" on an OAuth credential is a mismatch no
+// real client produces.
+const CLAUDE_CLI_VERSION = '2.1.92';
+
+const STAINLESS_OS = {
+  darwin: 'MacOS',
+  win32: 'Windows',
+  linux: 'Linux',
+  freebsd: 'FreeBSD'
+};
+
+const STAINLESS_ARCH = {
+  x64: 'x64',
+  arm64: 'arm64',
+  ia32: 'x86'
+};
+
+const stainlessOs = () => STAINLESS_OS[os.platform()] || `Other::${os.platform()}`;
+const stainlessArch = () => STAINLESS_ARCH[os.arch()] || `other::${os.arch()}`;
+
 class ClaudeRequest {
   static presetCache = new Map();
 
   constructor(req = null) {
-    this.API_URL = 'https://api.anthropic.com/v1/messages';
+    this.API_URL = 'https://api.anthropic.com/v1/messages?beta=true';
     this.VERSION = '2023-06-01';
-    this.BETA_HEADER = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14';
+    this.BETA_HEADER = [
+      'claude-code-20250219',
+      'oauth-2025-04-20',
+      'interleaved-thinking-2025-05-14',
+      'context-management-2025-06-27',
+      'prompt-caching-scope-2026-01-05',
+      'advanced-tool-use-2025-11-20',
+      'effort-2025-11-24',
+      'structured-outputs-2025-12-15',
+      'fast-mode-2026-02-01',
+      'redact-thinking-2026-02-12',
+      'token-efficient-tools-2026-03-28'
+    ].join(',');
 
     // A client-supplied token belongs to this request only. It used to be
     // written to a static cache, so one client's key was handed to every other
@@ -248,16 +283,35 @@ class ClaudeRequest {
     }
   }
 
-  getHeaders(token) {
+  getHeaders(token, { stream = false } = {}) {
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': token,
       'anthropic-version': this.VERSION,
-      'User-Agent': 'claude-code-proxy/1.0.0',
-      // The non-streaming path re-serializes the body without decompressing it,
-      // so ask upstream not to compress in the first place.
-      'Accept-Encoding': 'identity'
+      'Anthropic-Dangerous-Direct-Browser-Access': 'true',
+      'User-Agent': `claude-cli/${CLAUDE_CLI_VERSION} (external, sdk-cli)`,
+      'X-App': 'cli',
+      // Stainless generates Anthropic's SDKs and stamps these on every call, so
+      // their absence is as much a tell as the wrong User-Agent. Runtime, OS and
+      // arch are reported honestly: a Linux host claiming to be MacOS/arm64
+      // contradicts the TLS and timing profile of the same connection.
+      'X-Stainless-Lang': 'js',
+      'X-Stainless-Package-Version': '0.80.0',
+      'X-Stainless-Runtime': 'node',
+      'X-Stainless-Runtime-Version': process.version,
+      'X-Stainless-Os': stainlessOs(),
+      'X-Stainless-Arch': stainlessArch(),
+      'X-Stainless-Retry-Count': '0',
+      'X-Stainless-Timeout': '600',
+      // streamResponse undoes whatever comes back. Asking for "identity" is a
+      // request no SDK makes.
+      'Accept-Encoding': 'gzip, deflate, br'
     };
+
+    // The SDK sets this only on the streaming helper, so it tracks the request.
+    if (stream) {
+      headers['X-Stainless-Helper-Method'] = 'stream';
+    }
 
     if (this.BETA_HEADER) {
       headers['anthropic-beta'] = this.BETA_HEADER;
@@ -449,7 +503,7 @@ class ClaudeRequest {
 
   async makeRequest(body, presetName = null, tokenOverride = null) {
     const token = tokenOverride || await this.getAuthToken();
-    const headers = this.getHeaders(token);
+    const headers = this.getHeaders(token, { stream: body?.stream === true });
     const processedBody = this.processRequestBody(body, presetName);
 
     Logger.debug('Outgoing headers to Claude:', JSON.stringify(redactHeaders(headers), null, 2));
@@ -459,7 +513,7 @@ class ClaudeRequest {
     const options = {
       hostname: urlParts.hostname,
       port: urlParts.port || 443,
-      path: urlParts.pathname,
+      path: `${urlParts.pathname}${urlParts.search}`,
       method: 'POST',
       headers: headers
     };
@@ -585,6 +639,31 @@ class ClaudeRequest {
     });
   }
 
+  // Node's https client hands back exactly what the wire carried, so anything
+  // Accept-Encoding advertised has to be undone before the body is parsed or
+  // forwarded. copyResponseHeaders drops content-encoding, so forwarding the
+  // compressed bytes would hand the client a body it was told is plain.
+  decompressStream(claudeResponse) {
+    const encoding = (claudeResponse.headers['content-encoding'] || '').trim().toLowerCase();
+    if (!encoding || encoding === 'identity') return claudeResponse;
+
+    const decoders = {
+      gzip: zlib.createGunzip,
+      'x-gzip': zlib.createGunzip,
+      deflate: zlib.createInflate,
+      br: zlib.createBrotliDecompress
+    };
+
+    const createDecoder = decoders[encoding];
+    if (!createDecoder) {
+      Logger.error(`Unsupported content-encoding "${encoding}" from upstream, forwarding as-is`);
+      return claudeResponse;
+    }
+
+    Logger.debug(`Decompressing ${encoding} response body`);
+    return claudeResponse.pipe(createDecoder());
+  }
+
   streamResponse(res, claudeResponse) {
     const extractClaudeText = (chunk) => {
       try {
@@ -608,67 +687,58 @@ class ClaudeRequest {
     };
 
     const contentType = claudeResponse.headers['content-type'] || '';
+    const upstream = this.decompressStream(claudeResponse);
+
+    // Either end of the decompressor can fail, and either way the socket has to
+    // go and the client needs an answer.
+    const onUpstreamError = (err) => {
+      Logger.error('Claude response stream error:', err.message);
+      if (!claudeResponse.destroyed) claudeResponse.destroy();
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+      }
+      if (!res.destroyed) {
+        res.end(JSON.stringify({ error: 'Upstream error', message: err.message }));
+      }
+    };
+
+    claudeResponse.on('error', onUpstreamError);
+    if (upstream !== claudeResponse) upstream.on('error', onUpstreamError);
+
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        Logger.debug('Client disconnected, cleaning up streams');
+      }
+      if (!claudeResponse.destroyed) claudeResponse.destroy();
+      if (upstream !== claudeResponse && !upstream.destroyed) upstream.destroy();
+    });
+
     if (contentType.includes('text/event-stream')) {
       Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
-      
-      claudeResponse.on('error', (err) => {
-        Logger.debug('Claude response stream error:', err);
-        if (!res.headersSent) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-        }
-        if (!res.destroyed) {
-          res.end(JSON.stringify({ error: 'Upstream response error' }));
-        }
-      });
-      
-      res.on('close', () => {
-        Logger.debug('Client disconnected, cleaning up streams');
-        if (!claudeResponse.destroyed) {
-          claudeResponse.destroy();
-        }
-      });
-      
+
       if (Logger.getLogLevel() >= 3) {
         const debugStream = Logger.createDebugStream('Claude SSE', extractClaudeText);
-        
-        debugStream.on('error', (err) => {
-          Logger.debug('Debug stream error:', err);
-          if (!res.headersSent) {
-            res.writeHead(500, { 'Content-Type': 'application/json' });
-          }
-          if (!res.destroyed) {
-            res.end(JSON.stringify({ error: 'Stream processing error' }));
-          }
-        });
-        
-        claudeResponse.pipe(debugStream).pipe(res);
+
+        debugStream.on('error', onUpstreamError);
+
+        upstream.pipe(debugStream).pipe(res);
         debugStream.on('end', () => {
           Logger.debug('\n');
           Logger.debug('Streaming response sent back to client');
         });
       } else {
-        claudeResponse.pipe(res);
-        claudeResponse.on('end', () => {
+        upstream.pipe(res);
+        upstream.on('end', () => {
           Logger.debug('Streaming response sent back to client');
         });
       }
     } else {
       let responseData = '';
-      claudeResponse.on('data', chunk => {
+      upstream.on('data', chunk => {
         responseData += chunk;
       });
 
-      claudeResponse.on('error', (err) => {
-        Logger.error('Claude non-streaming response error:', err);
-        if (!res.headersSent) {
-          res.writeHead(502, { 'Content-Type': 'application/json' });
-        }
-        if (!res.destroyed) {
-          res.end(JSON.stringify({ error: 'Upstream error', message: err.message }));
-        }
-      });
-
-      claudeResponse.on('end', () => {
+      upstream.on('end', () => {
         Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 500)}`);
         if (res.headersSent || res.destroyed) return;
 

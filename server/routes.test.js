@@ -61,6 +61,7 @@ describe('POST /v1/:preset/messages', () => {
   it('forwards a known preset', async () => {
     const scope = nock('https://api.anthropic.com')
       .post('/v1/messages')
+      .query({ beta: 'true' })
       .reply(200, JSON.stringify({ id: 'msg_1' }), { 'content-type': 'application/json' });
 
     const response = await request(server())
