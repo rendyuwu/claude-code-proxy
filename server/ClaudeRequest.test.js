@@ -462,6 +462,75 @@ describe('client identity headers', () => {
   });
 });
 
+describe('CLI request fingerprint', () => {
+  const OAT = 'sk-ant-oat01-TEST-TOKEN';
+
+  it('carries the billing block and a derived user_id on a subscription token', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: SONNET,
+      system: 'be terse',
+      messages: [{ role: 'user', content: 'hi' }]
+    }, null, `Bearer ${OAT}`);
+
+    expect(processed.system[0].text).toMatch(/^x-anthropic-billing-header:/);
+    expect(processed.system[1].text).toMatch(/^You are Claude Code/);
+    expect(processed.system[2].text).toBe('be terse');
+    expect(JSON.parse(processed.metadata.user_id)).toHaveProperty('device_id');
+  });
+
+  it('adds nothing when the request is not on a subscription token', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: SONNET,
+      messages: [{ role: 'user', content: 'hi' }]
+    }, null, 'Bearer sk-ant-api03-KEY');
+
+    expect(processed.system[0].text).toMatch(/^You are Claude Code/);
+    expect(processed.metadata).toBeUndefined();
+  });
+
+  it('sends a byte-identical prefix on every turn so the cache is not thrown away', async () => {
+    OAuthManager.getValidAccessToken.mockResolvedValue(OAT);
+    const sentBodies = [];
+    const capture = (body) => { sentBodies.push(body); return true; };
+
+    for (const turn of ['first', 'second']) {
+      nock('https://api.anthropic.com')
+        .post('/v1/messages', capture)
+        .query({ beta: 'true' })
+        .reply(200, { ok: true });
+
+      await request(messagesServer())
+        .post('/v1/messages')
+        .send({
+          model: SONNET,
+          system: 'be terse',
+          messages: [{ role: 'user', content: 'hi' }, { role: 'assistant', content: turn }]
+        });
+    }
+
+    expect(sentBodies).toHaveLength(2);
+    expect(sentBodies[1].system).toEqual(sentBodies[0].system);
+    expect(sentBodies[1].metadata).toEqual(sentBodies[0].metadata);
+  });
+
+  it('keeps the same body across the 401 retry', async () => {
+    OAuthManager.getValidAccessToken.mockResolvedValue(OAT);
+    OAuthManager.refreshAccessToken.mockResolvedValue({ access_token: OAT });
+    const sentBodies = [];
+    const capture = (body) => { sentBodies.push(body); return true; };
+
+    nock('https://api.anthropic.com').post('/v1/messages', capture).query({ beta: 'true' }).reply(401, {});
+    nock('https://api.anthropic.com').post('/v1/messages', capture).query({ beta: 'true' }).reply(200, { ok: true });
+
+    await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(sentBodies[1]).toEqual(sentBodies[0]);
+    expect(sentBodies[0].system.filter(s => s.text.startsWith('x-anthropic-billing-header:'))).toHaveLength(1);
+  });
+});
+
 describe('compressed upstream responses', () => {
   it('decompresses a gzipped non-streaming body before framing it', async () => {
     const payload = JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'hi' }] });

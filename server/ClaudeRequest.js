@@ -7,6 +7,7 @@ const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const { redactHeaders } = require('./redact');
+const { applyCloaking } = require('./cloaking');
 
 // Load configuration
 const loadConfig = () => {
@@ -46,6 +47,10 @@ const STRIP_CACHE_CONTROL_TTL = CONFIG.strip_cache_control_ttl === true; // Defa
 // Socket inactivity timeout, not a total deadline: streaming responses keep
 // resetting it, so only a genuinely stalled upstream trips it.
 const UPSTREAM_TIMEOUT_MS = parseInt(CONFIG.upstream_timeout_ms, 10) || 300000;
+// Billing header and metadata.user_id, as the CLI sends them. Turn this off if
+// Anthropic ever starts rejecting a system array that does not open with the
+// Claude Code sentence.
+const INJECT_BILLING_HEADER = CONFIG.inject_billing_header !== false; // Default to true
 
 // The proxy speaks to api.anthropic.com with a Claude Code subscription token,
 // so it identifies itself the way the CLI that owns that token does. A
@@ -343,7 +348,7 @@ class ClaudeRequest {
     return [{ type: 'text', text: system }];
   }
 
-  processRequestBody(body, presetName = null) {
+  processRequestBody(body, presetName = null, token = null) {
     if (!body) return body;
 
     let processed = this.cloneBody(body);
@@ -365,6 +370,12 @@ class ClaudeRequest {
     // Never send an empty system array upstream.
     if (processed.system.length === 0) {
       delete processed.system;
+    }
+
+    // Last, so the billing block ends up ahead of everything the client and the
+    // preset contributed, which is where the CLI puts it.
+    if (INJECT_BILLING_HEADER) {
+      applyCloaking(processed, token);
     }
 
     if (STRIP_CACHE_CONTROL_TTL) {
@@ -500,7 +511,7 @@ class ClaudeRequest {
   async makeRequest(body, presetName = null, tokenOverride = null) {
     const token = tokenOverride || await this.getAuthToken();
     const headers = this.getHeaders(token, { stream: body?.stream === true });
-    const processedBody = this.processRequestBody(body, presetName);
+    const processedBody = this.processRequestBody(body, presetName, token);
 
     Logger.debug('Outgoing headers to Claude:', JSON.stringify(redactHeaders(headers), null, 2));
     Logger.debug(`Final request to Claude (${JSON.stringify(processedBody).length} bytes):`, JSON.stringify(processedBody, null, 2));
