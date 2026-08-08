@@ -348,19 +348,15 @@ class ClaudeRequest {
 
     let processed = this.cloneBody(body);
 
-    // Skip system prompt injection for Haiku models
-    const isHaiku = processed.model && processed.model.toLowerCase().includes('haiku');
-
     processed.system = this.normalizeSystem(processed.system);
 
-    if (!isHaiku) {
-      processed.system.unshift({
-        type: 'text',
-        text: 'You are Claude Code, Anthropic\'s official CLI for Claude.'
-      });
-    } else {
-      Logger.debug('Skipping Claude Code system prompt for Haiku model');
-    }
+    // Every model, Haiku included. The CLI sends this line whatever it is
+    // talking to, so exempting one model family made those requests the odd
+    // ones out on an account whose other traffic always carries it.
+    processed.system.unshift({
+      type: 'text',
+      text: 'You are Claude Code, Anthropic\'s official CLI for Claude.'
+    });
 
     if (presetName) {
       this.applyPreset(processed, presetName);

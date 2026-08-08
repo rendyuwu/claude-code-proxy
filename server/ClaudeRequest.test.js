@@ -87,24 +87,18 @@ describe('processRequestBody', () => {
     expect(first.system.filter(s => s.text.startsWith('You are Claude Code'))).toHaveLength(1);
   });
 
-  it('injects the Claude Code system prompt exactly once for non-Haiku models', () => {
+  it.each([
+    ['Sonnet', SONNET],
+    ['Haiku', HAIKU]
+  ])('injects the Claude Code system prompt exactly once for %s', (_label, model) => {
     const processed = new ClaudeRequest().processRequestBody({
-      model: SONNET,
+      model,
       messages: [{ role: 'user', content: 'hi' }]
     });
 
     expect(processed.system).toEqual([
       { type: 'text', text: 'You are Claude Code, Anthropic\'s official CLI for Claude.' }
     ]);
-  });
-
-  it('skips the Claude Code system prompt for Haiku and leaves no system field behind', () => {
-    const processed = new ClaudeRequest().processRequestBody({
-      model: HAIKU,
-      messages: [{ role: 'user', content: 'hi' }]
-    });
-
-    expect(processed.system).toBeUndefined();
   });
 
   it.each([
@@ -118,14 +112,13 @@ describe('processRequestBody', () => {
     const processed = new ClaudeRequest().processRequestBody(body, 'pyrite');
 
     expect(Array.isArray(processed.system)).toBe(true);
-    expect(processed.system.length).toBeGreaterThan(0);
     expect(processed.system.every(block => block.type === 'text')).toBe(true);
-    // Preset injects a suffix user turn, and no Claude Code prompt for Haiku.
+    // Preset injects a suffix user turn.
     expect(processed.messages).toHaveLength(2);
-    expect(processed.system.some(block => block.text.startsWith('You are Claude Code'))).toBe(false);
+    expect(processed.system[0].text).toMatch(/^You are Claude Code/);
   });
 
-  it('normalizes a string system field for non-Haiku models', () => {
+  it('normalizes a string system field', () => {
     const processed = new ClaudeRequest().processRequestBody({
       model: SONNET,
       system: 'be terse',
