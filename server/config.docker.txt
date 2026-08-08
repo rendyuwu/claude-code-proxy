@@ -6,6 +6,7 @@ log_level=INFO  # TRACE, DEBUG, INFO, WARN, ERROR
 filter_sampling_params=true  # Set to true to ensure only one sampling parameter is sent (required for Sonnet 4.5 compatibility). Removes default values (1.0) and prefers temperature over top_p when both are non-default.
 upstream_timeout_ms=300000  # Abort a request to api.anthropic.com after this many ms of socket inactivity. Streaming resets the timer.
 inject_billing_header=true  # Send the billing header block and metadata.user_id the way Claude Code 2.1.92 does. Both are derived from your token, never randomized, so the cached prefix stays byte-identical between turns. Set to false if Anthropic ever rejects a system array that does not open with the Claude Code sentence.
+cloak_tools=true  # Rename the tools your front end declares (suffix _ide) and declare Claude Code's own tool set alongside them, marked unavailable, so the tool list looks like the CLI that owns the token. Names are put back in the response, streaming included. Set to false if your front end trips over it.
 strip_cache_control_ttl=false  # Leave false. Upstream accepts cache_control.ttl, so stripping it downgrades every "1h" breakpoint your front end asks for to the 5m default. Set to true only if Anthropic starts rejecting the field.
 
 # OAuth Settings

@@ -531,6 +531,102 @@ describe('CLI request fingerprint', () => {
   });
 });
 
+describe('tool cloaking end to end', () => {
+  const OAT = 'sk-ant-oat01-TEST-TOKEN';
+  const clientTools = [{ name: 'search_web', description: 'search', input_schema: { type: 'object' } }];
+
+  const sendWithTools = (extra = {}) => request(messagesServer())
+    .post('/v1/messages')
+    .send({ model: SONNET, tools: clientTools, messages: [{ role: 'user', content: 'hi' }], ...extra });
+
+  beforeEach(() => {
+    OAuthManager.getValidAccessToken.mockResolvedValue(OAT);
+  });
+
+  it('sends renamed client tools and the Claude Code set upstream', async () => {
+    let sent;
+    nock('https://api.anthropic.com')
+      .post('/v1/messages', (body) => { sent = body; return true; })
+      .query({ beta: 'true' })
+      .reply(200, { id: 'msg_1', content: [] });
+
+    await sendWithTools();
+
+    const names = sent.tools.map(t => t.name);
+    expect(names[0]).toBe('search_web_ide');
+    expect(names).toContain('Bash');
+    expect(names).toContain('WebSearch');
+    expect(names).not.toContain('search_web');
+  });
+
+  it('leaves the tools alone when the request is not on a subscription token', async () => {
+    OAuthManager.getValidAccessToken.mockResolvedValue('plain-token');
+    let sent;
+    nock('https://api.anthropic.com')
+      .post('/v1/messages', (body) => { sent = body; return true; })
+      .query({ beta: 'true' })
+      .reply(200, { id: 'msg_1', content: [] });
+
+    await sendWithTools();
+
+    expect(sent.tools).toEqual(clientTools);
+  });
+
+  it('gives the client its own tool name back in a non-streaming response', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, JSON.stringify({
+        id: 'msg_1',
+        content: [
+          { type: 'text', text: 'looking that up' },
+          { type: 'tool_use', id: 'tu_1', name: 'search_web_ide', input: { q: 'x' } }
+        ]
+      }), { 'content-type': 'application/json' });
+
+    const response = await sendWithTools();
+
+    expect(response.body.content[1].name).toBe('search_web');
+  });
+
+  it('gives the client its own tool name back in a streamed response', async () => {
+    const sse = 'event: content_block_start\n'
+      + 'data: {"type":"content_block_start","index":0,"content_block":'
+      + '{"type":"tool_use","id":"tu_1","name":"search_web_ide","input":{}}}\n\n'
+      + 'event: content_block_delta\n'
+      + 'data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n';
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, sse, { 'content-type': 'text/event-stream' });
+
+    const response = await sendWithTools({ stream: true });
+
+    expect(response.text).toContain('"name":"search_web"');
+    expect(response.text).not.toContain('search_web_ide');
+    // Everything that is not a tool name is forwarded untouched.
+    expect(response.text).toContain('"partial_json":"{}"');
+  });
+
+  it('does not touch a response for a request that carried no tools', async () => {
+    const sse = 'event: content_block_start\n'
+      + 'data: {"type":"content_block_start","index":0,"content_block":'
+      + '{"type":"tool_use","id":"tu_1","name":"search_web_ide","input":{}}}\n\n';
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, sse, { 'content-type': 'text/event-stream' });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, stream: true, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.text).toBe(sse);
+  });
+});
+
 describe('compressed upstream responses', () => {
   it('decompresses a gzipped non-streaming body before framing it', async () => {
     const payload = JSON.stringify({ id: 'msg_1', content: [{ type: 'text', text: 'hi' }] });

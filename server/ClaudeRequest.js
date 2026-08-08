@@ -7,7 +7,8 @@ const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const { redactHeaders } = require('./redact');
-const { applyCloaking } = require('./cloaking');
+const { applyCloaking, cloakTools, decloakToolNames, isOAuthToken } = require('./cloaking');
+const SseToolNameRewriter = require('./SseToolNameRewriter');
 
 // Load configuration
 const loadConfig = () => {
@@ -51,6 +52,9 @@ const UPSTREAM_TIMEOUT_MS = parseInt(CONFIG.upstream_timeout_ms, 10) || 300000;
 // Anthropic ever starts rejecting a system array that does not open with the
 // Claude Code sentence.
 const INJECT_BILLING_HEADER = CONFIG.inject_billing_header !== false; // Default to true
+// Rename the client's tools and declare Claude Code's own set alongside them,
+// then put the client's names back on the way out.
+const CLOAK_TOOLS = CONFIG.cloak_tools !== false; // Default to true
 
 // The proxy speaks to api.anthropic.com with a Claude Code subscription token,
 // so it identifies itself the way the CLI that owns that token does. A
@@ -97,6 +101,10 @@ class ClaudeRequest {
     // A client-supplied token belongs to this request only. It used to be
     // written to a static cache, so one client's key was handed to every other
     // client sharing the process.
+    // Set per request by processRequestBody; the response path uses it to put
+    // the client's tool names back.
+    this.toolNameMap = null;
+
     this.headerToken = null;
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
@@ -377,6 +385,10 @@ class ClaudeRequest {
     if (INJECT_BILLING_HEADER) {
       applyCloaking(processed, token);
     }
+
+    // Recomputed, not cached: the 401 retry runs this again and has to arrive at
+    // the same names the first attempt used.
+    this.toolNameMap = CLOAK_TOOLS && isOAuthToken(token) ? cloakTools(processed) : null;
 
     if (STRIP_CACHE_CONTROL_TTL) {
       processed = this.stripTtlFromCacheControl(processed);
@@ -712,6 +724,15 @@ class ClaudeRequest {
     claudeResponse.on('error', onUpstreamError);
     if (upstream !== claudeResponse) upstream.on('error', onUpstreamError);
 
+    // The streamed name has to be turned back before the client's tool runner
+    // sees it; the buffering branch does the same after parsing.
+    let source = upstream;
+    if (this.toolNameMap && contentType.includes('text/event-stream')) {
+      const rewriter = new SseToolNameRewriter(this.toolNameMap);
+      rewriter.on('error', onUpstreamError);
+      source = upstream.pipe(rewriter);
+    }
+
     res.on('close', () => {
       if (!res.writableEnded) {
         Logger.debug('Client disconnected, cleaning up streams');
@@ -728,29 +749,29 @@ class ClaudeRequest {
 
         debugStream.on('error', onUpstreamError);
 
-        upstream.pipe(debugStream).pipe(res);
+        source.pipe(debugStream).pipe(res);
         debugStream.on('end', () => {
           Logger.debug('\n');
           Logger.debug('Streaming response sent back to client');
         });
       } else {
-        upstream.pipe(res);
-        upstream.on('end', () => {
+        source.pipe(res);
+        source.on('end', () => {
           Logger.debug('Streaming response sent back to client');
         });
       }
     } else {
       let responseData = '';
-      upstream.on('data', chunk => {
+      source.on('data', chunk => {
         responseData += chunk;
       });
 
-      upstream.on('end', () => {
+      source.on('end', () => {
         Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 500)}`);
         if (res.headersSent || res.destroyed) return;
 
         try {
-          const payload = JSON.stringify(JSON.parse(responseData));
+          const payload = JSON.stringify(decloakToolNames(JSON.parse(responseData), this.toolNameMap));
           res.setHeader('Content-Type', 'application/json');
           res.setHeader('Content-Length', Buffer.byteLength(payload));
           Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));

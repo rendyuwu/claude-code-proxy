@@ -2,9 +2,13 @@ const {
   applyCloaking,
   buildBillingHeader,
   buildUserId,
+  cloakTools,
   conversationSeed,
+  decloakToolNames,
   isOAuthToken,
-  BILLING_PREFIX
+  BILLING_PREFIX,
+  CC_TOOL_NAMES,
+  MAX_TOOL_NAME_LENGTH
 } = require('./cloaking');
 
 const OAT = 'Bearer sk-ant-oat01-EXAMPLE-TOKEN';
@@ -121,5 +125,169 @@ describe('applyCloaking', () => {
 
     expect(body.system[1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
     expect(body.system[0].cache_control).toBeUndefined();
+  });
+});
+
+describe('cloakTools', () => {
+  const tool = (name, extra = {}) => ({ name, description: `does ${name}`, input_schema: { type: 'object' }, ...extra });
+
+  it('renames the client tools and keeps everything else about them', () => {
+    const body = { tools: [tool('search_web')] };
+    const map = cloakTools(body);
+
+    expect(body.tools[0]).toMatchObject({
+      name: 'search_web_ide',
+      description: 'does search_web',
+      input_schema: { type: 'object' }
+    });
+    expect(map.get('search_web_ide')).toBe('search_web');
+  });
+
+  it('declares the Claude Code tool set alongside them, marked unavailable', () => {
+    const body = { tools: [tool('search_web')] };
+    cloakTools(body);
+
+    const decoys = body.tools.slice(1);
+    expect(decoys.map(t => t.name)).toEqual(CC_TOOL_NAMES);
+    expect(decoys.every(t => t.description === 'This tool is currently unavailable.')).toBe(true);
+  });
+
+  it('leaves a server-side tool alone, since its name is reserved', () => {
+    const body = { tools: [{ type: 'web_search_20250305', name: 'web_search' }, tool('mine')] };
+    const map = cloakTools(body);
+
+    expect(body.tools[0]).toEqual({ type: 'web_search_20250305', name: 'web_search' });
+    expect(map.has('web_search_ide')).toBe(false);
+    expect(map.get('mine_ide')).toBe('mine');
+  });
+
+  it('leaves a name that cannot carry the suffix, rather than sending an invalid one', () => {
+    const long = 'm'.repeat(MAX_TOOL_NAME_LENGTH - 3);
+    const body = { tools: [tool(long)] };
+    const map = cloakTools(body);
+
+    expect(body.tools[0].name).toBe(long);
+    expect(map).toBeNull();
+  });
+
+  it('does not declare a decoy whose name a client tool already holds', () => {
+    const kept = `Read${'x'.repeat(MAX_TOOL_NAME_LENGTH)}`.slice(0, MAX_TOOL_NAME_LENGTH);
+    const body = { tools: [tool('Read'), tool(kept)] };
+    cloakTools(body);
+
+    const names = body.tools.map(t => t.name);
+    expect(names.filter(name => name === kept)).toHaveLength(1);
+    expect(new Set(names).size).toBe(names.length);
+    // "Read" moved out of the way, so the decoy can still take that name.
+    expect(names).toContain('Read_ide');
+    expect(names).toContain('Read');
+  });
+
+  it('points a forced tool_choice at the renamed tool', () => {
+    const body = { tools: [tool('mine')], tool_choice: { type: 'tool', name: 'mine' } };
+    cloakTools(body);
+
+    expect(body.tool_choice).toEqual({ type: 'tool', name: 'mine_ide' });
+  });
+
+  it('leaves tool_choice alone when it names nothing we renamed', () => {
+    const auto = { tools: [tool('mine')], tool_choice: { type: 'auto' } };
+    const decoy = { tools: [tool('mine')], tool_choice: { type: 'tool', name: 'Bash' } };
+
+    cloakTools(auto);
+    cloakTools(decoy);
+
+    expect(auto.tool_choice).toEqual({ type: 'auto' });
+    expect(decoy.tool_choice).toEqual({ type: 'tool', name: 'Bash' });
+  });
+
+  it('renames the tool_use blocks already in the history', () => {
+    const body = {
+      tools: [tool('mine')],
+      messages: [
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'mine', input: {} }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' }] }
+      ]
+    };
+    cloakTools(body);
+
+    expect(body.messages[0].content[0].name).toBe('mine_ide');
+    // tool_result refers back by id, so it is untouched.
+    expect(body.messages[1].content[0]).toEqual({ type: 'tool_result', tool_use_id: 'tu_1', content: 'ok' });
+  });
+
+  it('leaves a history tool_use for a tool that is no longer declared', () => {
+    const body = {
+      tools: [tool('mine')],
+      messages: [{ role: 'assistant', content: [{ type: 'tool_use', id: 'tu_1', name: 'gone', input: {} }] }]
+    };
+    cloakTools(body);
+
+    expect(body.messages[0].content[0].name).toBe('gone');
+  });
+
+  it('hands the trailing tool breakpoint to the last decoy so the decoys stay cached', () => {
+    const body = { tools: [tool('mine', { cache_control: { type: 'ephemeral', ttl: '1h' } })] };
+    cloakTools(body);
+
+    expect(body.tools[0].cache_control).toBeUndefined();
+    expect(body.tools[body.tools.length - 1].cache_control).toEqual({ type: 'ephemeral', ttl: '1h' });
+    expect(body.tools.filter(t => t.cache_control)).toHaveLength(1);
+  });
+
+  it('does not invent a tool breakpoint when the client set none', () => {
+    const body = { tools: [tool('mine')] };
+    cloakTools(body);
+
+    expect(body.tools.every(t => t.cache_control === undefined)).toBe(true);
+  });
+
+  it('does nothing without tools', () => {
+    expect(cloakTools({ messages: [] })).toBeNull();
+    expect(cloakTools({ tools: [] })).toBeNull();
+    expect(cloakTools(null)).toBeNull();
+  });
+
+  it('is stable, so the 401 retry sends the same names', () => {
+    const build = () => ({ tools: [tool('mine')], tool_choice: { type: 'tool', name: 'mine' } });
+    const first = build();
+    const second = build();
+
+    cloakTools(first);
+    cloakTools(second);
+
+    expect(second).toEqual(first);
+  });
+
+  it('does not let the decoys of one request leak into the next', () => {
+    const first = { tools: [tool('mine', { cache_control: { type: 'ephemeral' } })] };
+    cloakTools(first);
+    const second = { tools: [tool('other')] };
+    cloakTools(second);
+
+    expect(second.tools[second.tools.length - 1].cache_control).toBeUndefined();
+  });
+});
+
+describe('decloakToolNames', () => {
+  it('puts the client name back', () => {
+    const body = { content: [{ type: 'tool_use', name: 'mine_ide', input: {} }] };
+    decloakToolNames(body, new Map([['mine_ide', 'mine']]));
+
+    expect(body.content[0].name).toBe('mine');
+  });
+
+  it('leaves a decoy name it cannot map', () => {
+    const body = { content: [{ type: 'tool_use', name: 'Bash', input: {} }] };
+    decloakToolNames(body, new Map([['mine_ide', 'mine']]));
+
+    expect(body.content[0].name).toBe('Bash');
+  });
+
+  it('leaves text blocks and unmapped responses alone', () => {
+    const body = { content: [{ type: 'text', text: 'hi' }] };
+
+    expect(decloakToolNames(body, null)).toEqual({ content: [{ type: 'text', text: 'hi' }] });
+    expect(decloakToolNames(body, new Map())).toEqual({ content: [{ type: 'text', text: 'hi' }] });
   });
 });
