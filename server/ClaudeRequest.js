@@ -5,6 +5,7 @@ const os = require('os');
 const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const { redactHeaders } = require('./redact');
 
 // Load configuration
 const loadConfig = () => {
@@ -451,7 +452,7 @@ class ClaudeRequest {
     const headers = this.getHeaders(token);
     const processedBody = this.processRequestBody(body, presetName);
 
-    Logger.debug('Outgoing headers to Claude:', JSON.stringify(headers, null, 2));
+    Logger.debug('Outgoing headers to Claude:', JSON.stringify(redactHeaders(headers), null, 2));
     Logger.debug(`Final request to Claude (${JSON.stringify(processedBody).length} bytes):`, JSON.stringify(processedBody, null, 2));
 
     const urlParts = new URL(this.API_URL);

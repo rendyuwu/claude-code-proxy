@@ -5,6 +5,7 @@ const path = require('path');
 const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const { redactHeaders } = require('./redact');
 const { exec } = require('child_process');
 
 let config = {};
@@ -270,7 +271,7 @@ async function handleRequest(req, res) {
 
   if (req.method === 'POST' && (pathname === '/v1/messages' || pathname.match(/^\/v1\/\w+\/messages$/))) {
     try {
-      Logger.debug('Incoming request headers:', JSON.stringify(req.headers, null, 2));
+      Logger.debug('Incoming request headers:', JSON.stringify(redactHeaders(req.headers), null, 2));
       const body = await parseBody(req);
       Logger.debug(`Claude request body (${JSON.stringify(body).length} bytes):`, JSON.stringify(body, null, 2));
       
