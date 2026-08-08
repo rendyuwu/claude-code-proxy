@@ -739,6 +739,7 @@ class ClaudeRequest {
       }
       if (!claudeResponse.destroyed) claudeResponse.destroy();
       if (upstream !== claudeResponse && !upstream.destroyed) upstream.destroy();
+      if (source !== upstream && !source.destroyed) source.destroy();
     });
 
     if (contentType.includes('text/event-stream')) {
