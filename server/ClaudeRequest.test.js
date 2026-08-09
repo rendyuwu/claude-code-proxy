@@ -443,6 +443,24 @@ describe('client identity headers', () => {
     expect(beta).not.toContain('fine-grained-tool-streaming-2025-05-14');
   });
 
+  it('does not ask upstream to redact thinking unless configured to', () => {
+    // The flag makes upstream return thinking blocks with a signature and an
+    // empty body, so it is the one CLI flag that is off by default.
+    const beta = new ClaudeRequest().getHeaders('Bearer token')['anthropic-beta'].split(',');
+
+    expect(beta).not.toContain('redact-thinking-2026-02-12');
+  });
+
+  it('restores the flag in the CLI\'s own position when enabled', () => {
+    const on = ClaudeRequest.betaFlags(true);
+    const off = ClaudeRequest.betaFlags(false);
+
+    expect(on).toContain('redact-thinking-2026-02-12');
+    expect(on.indexOf('redact-thinking-2026-02-12'))
+      .toBe(on.indexOf('token-efficient-tools-2026-03-28') - 1);
+    expect(on.filter(flag => flag !== 'redact-thinking-2026-02-12')).toEqual(off);
+  });
+
   it('accepts compression instead of asking upstream for identity', () => {
     expect(new ClaudeRequest().getHeaders('Bearer token')['Accept-Encoding'])
       .toBe('gzip, deflate, br');

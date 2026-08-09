@@ -55,6 +55,14 @@ const INJECT_BILLING_HEADER = CONFIG.inject_billing_header !== false; // Default
 // Rename the client's tools and declare Claude Code's own set alongside them,
 // then put the client's names back on the way out.
 const CLOAK_TOOLS = CONFIG.cloak_tools !== false; // Default to true
+// The one piece of the CLI fingerprint that is off by default. The CLI asks for
+// redact-thinking because it renders reasoning as it streams and never needs the
+// text handed back; upstream honours the flag by returning thinking blocks with a
+// valid signature and an empty body. A front end that displays reasoning gets an
+// empty block while the thinking tokens are still counted and billed, which reads
+// as a proxy bug rather than a request the proxy made. Turn it on to match the
+// CLI's beta list exactly.
+const REDACT_THINKING = CONFIG.redact_thinking === true; // Default to false
 
 // The proxy speaks to api.anthropic.com with a Claude Code subscription token,
 // so it identifies itself the way the CLI that owns that token does. A
@@ -81,10 +89,11 @@ const stainlessArch = () => STAINLESS_ARCH[os.arch()] || `other::${os.arch()}`;
 class ClaudeRequest {
   static presetCache = new Map();
 
-  constructor(req = null) {
-    this.API_URL = 'https://api.anthropic.com/v1/messages?beta=true';
-    this.VERSION = '2023-06-01';
-    this.BETA_HEADER = [
+  // The CLI's list, in the CLI's order. redact-thinking keeps its position so
+  // enabling it reproduces the header byte for byte rather than appending it at
+  // the end, where the order alone would be a tell.
+  static betaFlags(redactThinking = REDACT_THINKING) {
+    return [
       'claude-code-20250219',
       'oauth-2025-04-20',
       'interleaved-thinking-2025-05-14',
@@ -94,9 +103,15 @@ class ClaudeRequest {
       'effort-2025-11-24',
       'structured-outputs-2025-12-15',
       'fast-mode-2026-02-01',
-      'redact-thinking-2026-02-12',
+      ...(redactThinking ? ['redact-thinking-2026-02-12'] : []),
       'token-efficient-tools-2026-03-28'
-    ].join(',');
+    ];
+  }
+
+  constructor(req = null) {
+    this.API_URL = 'https://api.anthropic.com/v1/messages?beta=true';
+    this.VERSION = '2023-06-01';
+    this.BETA_HEADER = ClaudeRequest.betaFlags().join(',');
 
     // A client-supplied token belongs to this request only. It used to be
     // written to a static cache, so one client's key was handed to every other
