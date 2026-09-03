@@ -28,6 +28,7 @@ const ClaudeRequest = require('./ClaudeRequest');
 
 const SONNET = 'claude-sonnet-4-5-20250929';
 const HAIKU = 'claude-haiku-4-5-20251001';
+const FABLE = 'claude-fable-5-1';
 
 // Minimal stand-in for server.js's /v1/messages route so the response path
 // (status, headers, body framing) is exercised for real.
@@ -129,6 +130,58 @@ describe('processRequestBody', () => {
       { type: 'text', text: 'You are Claude Code, Anthropic\'s official CLI for Claude.' },
       { type: 'text', text: 'be terse' }
     ]);
+  });
+});
+
+describe('sampling parameters', () => {
+  // Front ends commonly send top_k=0 on every request, and every Claude 5 model
+  // answers 400 "`top_k` is deprecated for this model". Verified live against
+  // api.anthropic.com: fable-5-1, opus-5 and sonnet-5 all reject it, haiku-4-5
+  // still accepts it.
+  it.each([
+    ['zero', 0],
+    ['non-zero', 40]
+  ])('drops a %s top_k', (_label, topK) => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: FABLE,
+      top_k: topK,
+      messages: [{ role: 'user', content: 'hi' }]
+    });
+
+    expect(processed).not.toHaveProperty('top_k');
+  });
+
+  it('drops top_k without touching a non-default temperature', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: FABLE,
+      top_k: 0,
+      temperature: 0.7,
+      messages: [{ role: 'user', content: 'hi' }]
+    });
+
+    expect(processed).not.toHaveProperty('top_k');
+    expect(processed.temperature).toBe(0.7);
+  });
+
+  it('leaves the caller body untouched when stripping top_k', () => {
+    const body = { model: FABLE, top_k: 0, messages: [{ role: 'user', content: 'hi' }] };
+    new ClaudeRequest().processRequestBody(body);
+
+    expect(body.top_k).toBe(0);
+  });
+
+  it('sends only temperature when the client asks for both defaults', () => {
+    const processed = new ClaudeRequest().processRequestBody({
+      model: FABLE,
+      top_k: 0,
+      temperature: 1,
+      top_p: 1,
+      messages: [{ role: 'user', content: 'hi' }]
+    });
+
+    expect(processed).not.toHaveProperty('top_k');
+    expect(processed).not.toHaveProperty('top_p');
+    expect(processed.temperature).toBe(1);
   });
 });
 

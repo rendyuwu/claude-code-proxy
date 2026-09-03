@@ -169,6 +169,16 @@ class ClaudeRequest {
     if (!FILTER_SAMPLING_PARAMS) return body;
     if (!body || typeof body !== 'object') return body;
 
+    // Every Claude 5 model rejects top_k outright ("`top_k` is deprecated for
+    // this model", 400), and the CLI this proxy imitates never sends it, so it
+    // goes regardless of value. Front ends commonly send top_k=0, which is a
+    // no-op anyway; a non-zero one is worth less than a request that works.
+    if (body.top_k !== undefined) {
+      const topKValue = body.top_k;
+      delete body.top_k;
+      Logger.debug(`Removed top_k=${topKValue} from request (deprecated on Claude 5 models)`);
+    }
+
     const hasTemperature = body.temperature !== undefined;
     const hasTopP = body.top_p !== undefined;
 

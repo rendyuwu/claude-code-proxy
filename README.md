@@ -168,6 +168,7 @@ Most likely thing to go wrong is not being able to find the credentials, either 
 - A preset path with a name that doesn't exist (`/v1/typo/messages`) returns 400 with the list of real presets, rather than quietly sending the request with no preset applied
 - A request to Anthropic is aborted after `upstream_timeout_ms` of socket inactivity (default 300000). Streaming resets the timer, so only a genuinely stalled upstream trips it
 - Optionally filter sampling parameters to avoid conflicts with Sonnet 4.5. Set `filter_sampling_params=true` in `server/config.txt` to enable this feature, which ensures only one sampling parameter is sent to the API. When both `temperature` and `top_p` are specified, it removes whichever is at the default value (1.0), or prefers temperature if both are non-default (Sonnet 4.5 doesn't allow both parameters). Other models work fine with both parameters, so this defaults to off
+- The same filter drops `top_k` entirely, whatever its value. Every Claude 5 model answers 400 `` `top_k` is deprecated for this model `` — verified against `claude-fable-5-1`, `claude-opus-5` and `claude-sonnet-5`, while `claude-haiku-4-5` still accepts it. Front ends commonly send `top_k=0` on every request, so without the filter every Claude 5 generation fails before it starts. The CLI this proxy imitates never sends `top_k` at all
 
 ### Smart Host Binding
 - **Native execution**: Binds to `127.0.0.1` (secure, local-only)
