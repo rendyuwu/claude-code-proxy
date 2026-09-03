@@ -33,7 +33,7 @@ describe('isOAuthToken', () => {
 describe('billing header', () => {
   it('matches the shape the CLI sends', () => {
     expect(buildBillingHeader(OAT))
-      .toMatch(/^x-anthropic-billing-header: cc_version=2\.1\.92\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};$/);
+      .toMatch(/^x-anthropic-billing-header: cc_version=2\.1\.258\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5};$/);
   });
 
   it('is byte-identical across calls so it cannot invalidate the cached prefix', () => {

@@ -1,9 +1,9 @@
 const crypto = require('crypto');
 
-// Claude Code 2.1.92 sends a billing header as the first system block and a
+// Claude Code 2.1.258 sends a billing header as the first system block and a
 // JSON-shaped metadata.user_id alongside it. Both are reproduced here so a
 // request carrying a subscription token looks like the client that owns it.
-const CLAUDE_CLI_VERSION = '2.1.92';
+const CLAUDE_CLI_VERSION = '2.1.258';
 const CC_ENTRYPOINT = 'sdk-cli';
 
 const BILLING_PREFIX = 'x-anthropic-billing-header:';

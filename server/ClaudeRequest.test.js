@@ -405,7 +405,7 @@ describe('client identity headers', () => {
   it('presents itself as the Claude Code CLI that owns the credential', () => {
     const headers = new ClaudeRequest().getHeaders('Bearer token');
 
-    expect(headers['User-Agent']).toBe('claude-cli/2.1.92 (external, sdk-cli)');
+    expect(headers['User-Agent']).toBe('claude-cli/2.1.258 (external, sdk-cli)');
     expect(headers['X-App']).toBe('cli');
     expect(headers['Anthropic-Dangerous-Direct-Browser-Access']).toBe('true');
     expect(JSON.stringify(headers)).not.toMatch(/claude-code-proxy/);

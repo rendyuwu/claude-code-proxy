@@ -68,7 +68,7 @@ const REDACT_THINKING = CONFIG.redact_thinking === true; // Default to false
 // so it identifies itself the way the CLI that owns that token does. A
 // User-Agent of "claude-code-proxy" on an OAuth credential is a mismatch no
 // real client produces.
-const CLAUDE_CLI_VERSION = '2.1.92';
+const CLAUDE_CLI_VERSION = '2.1.258';
 
 const STAINLESS_OS = {
   darwin: 'MacOS',
