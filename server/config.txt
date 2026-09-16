@@ -1,9 +1,9 @@
 port=42069
 # Leave blank for auto-detect (127.0.0.1 native, 0.0.0.0 Docker)
 # Set explicitly to override: host=127.0.0.1 or host=0.0.0.0
-host=
-log_level=INFO  # TRACE, DEBUG, INFO, WARN, ERROR
-filter_sampling_params=true  # Set to true to ensure only one sampling parameter is sent (required for Sonnet 4.5 compatibility). Removes default values (1.0) and prefers temperature over top_p when both are non-default. Also drops top_k, which every Claude 5 model rejects with 400 "`top_k` is deprecated for this model" and which many front ends send on every request.
+host=0.0.0.0
+log_level=DEBUG  # TRACE, DEBUG, INFO, WARN, ERROR
+filter_sampling_params=true  # Drops top_k, temperature and top_p whatever their values. Anthropic deprecated all three on the current models and answers 400 "`x` is deprecated for this model" before a token is generated: top_k on every Claude 5, temperature and top_p from claude-opus-4-7 onward. Front ends send them on every request, so leaving this off makes every newer model fail before it starts. Set to false to keep sampling control on claude-opus-4-6 and older, which still honour it.
 upstream_timeout_ms=300000  # Abort a request to api.anthropic.com after this many ms of socket inactivity. Streaming resets the timer.
 inject_billing_header=true  # Send the billing header block and metadata.user_id the way Claude Code 2.1.258 does. Both are derived from your token, never randomized, so the cached prefix stays byte-identical between turns. Set to false if Anthropic ever rejects a system array that does not open with the Claude Code sentence.
 cloak_tools=true  # Rename the tools your front end declares (suffix _ide) and declare Claude Code's own tool set alongside them, marked unavailable, so the tool list looks like the CLI that owns the token. Names are put back in the response, streaming included. Set to false if your front end trips over it.

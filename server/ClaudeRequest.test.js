@@ -134,54 +134,54 @@ describe('processRequestBody', () => {
 });
 
 describe('sampling parameters', () => {
-  // Front ends commonly send top_k=0 on every request, and every Claude 5 model
-  // answers 400 "`top_k` is deprecated for this model". Verified live against
-  // api.anthropic.com: fable-5-1, opus-5 and sonnet-5 all reject it, haiku-4-5
-  // still accepts it.
+  // Front ends send these on every request, and the models this proxy is used
+  // with answer 400 "`x` is deprecated for this model": top_k on every Claude 5,
+  // temperature and top_p from claude-opus-4-7 onward. Verified live against
+  // api.anthropic.com.
   it.each([
-    ['zero', 0],
-    ['non-zero', 40]
-  ])('drops a %s top_k', (_label, topK) => {
+    ['zero', 'top_k', 0],
+    ['non-zero', 'top_k', 40],
+    ['default', 'temperature', 1],
+    ['non-default', 'temperature', 0.7],
+    ['default', 'top_p', 1],
+    ['non-default', 'top_p', 0.95]
+  ])('drops a %s %s', (_label, param, value) => {
     const processed = new ClaudeRequest().processRequestBody({
       model: FABLE,
-      top_k: topK,
+      [param]: value,
       messages: [{ role: 'user', content: 'hi' }]
     });
 
-    expect(processed).not.toHaveProperty('top_k');
+    expect(processed).not.toHaveProperty(param);
   });
 
-  it('drops top_k without touching a non-default temperature', () => {
+  it('drops every sampling parameter when the client sends all three', () => {
     const processed = new ClaudeRequest().processRequestBody({
       model: FABLE,
       top_k: 0,
       temperature: 0.7,
+      top_p: 0.95,
       messages: [{ role: 'user', content: 'hi' }]
     });
 
     expect(processed).not.toHaveProperty('top_k');
-    expect(processed.temperature).toBe(0.7);
+    expect(processed).not.toHaveProperty('temperature');
+    expect(processed).not.toHaveProperty('top_p');
   });
 
-  it('leaves the caller body untouched when stripping top_k', () => {
-    const body = { model: FABLE, top_k: 0, messages: [{ role: 'user', content: 'hi' }] };
+  it('leaves the caller body untouched when stripping sampling parameters', () => {
+    const body = {
+      model: FABLE,
+      top_k: 0,
+      temperature: 0.7,
+      top_p: 0.95,
+      messages: [{ role: 'user', content: 'hi' }]
+    };
     new ClaudeRequest().processRequestBody(body);
 
     expect(body.top_k).toBe(0);
-  });
-
-  it('sends only temperature when the client asks for both defaults', () => {
-    const processed = new ClaudeRequest().processRequestBody({
-      model: FABLE,
-      top_k: 0,
-      temperature: 1,
-      top_p: 1,
-      messages: [{ role: 'user', content: 'hi' }]
-    });
-
-    expect(processed).not.toHaveProperty('top_k');
-    expect(processed).not.toHaveProperty('top_p');
-    expect(processed.temperature).toBe(1);
+    expect(body.temperature).toBe(0.7);
+    expect(body.top_p).toBe(0.95);
   });
 });
 

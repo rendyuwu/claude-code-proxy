@@ -169,56 +169,27 @@ class ClaudeRequest {
     if (!FILTER_SAMPLING_PARAMS) return body;
     if (!body || typeof body !== 'object') return body;
 
-    // Every Claude 5 model rejects top_k outright ("`top_k` is deprecated for
-    // this model", 400), and the CLI this proxy imitates never sends it, so it
-    // goes regardless of value. Front ends commonly send top_k=0, which is a
-    // no-op anyway; a non-zero one is worth less than a request that works.
-    if (body.top_k !== undefined) {
-      const topKValue = body.top_k;
-      delete body.top_k;
-      Logger.debug(`Removed top_k=${topKValue} from request (deprecated on Claude 5 models)`);
-    }
+    // All three are deprecated on the models this proxy is used with, and each
+    // is answered with a 400 before a token is generated: top_k on every
+    // Claude 5, temperature and top_p from claude-opus-4-7 onward. Verified
+    // live against api.anthropic.com: claude-opus-5, claude-sonnet-5,
+    // claude-fable-5, claude-fable-5-1, claude-opus-4-8 and claude-opus-4-7 all
+    // answer "`temperature` is deprecated for this model", while
+    // claude-opus-4-6 and older still accept it.
+    //
+    // So they go regardless of value, the way top_k already did. Keying the
+    // removal off a model list would mean maintaining the list that forwarding
+    // GET /v1/models exists to avoid, and the CLI this proxy imitates sends
+    // none of the three. Dropping them costs sampling control on the older
+    // models that still honour it; set filter_sampling_params=false to get that
+    // back, at the price of every newer model 400ing again.
+    ['top_k', 'temperature', 'top_p'].forEach(param => {
+      if (body[param] === undefined) return;
 
-    const hasTemperature = body.temperature !== undefined;
-    const hasTopP = body.top_p !== undefined;
-
-    // If both are present, we need to keep only one
-    if (hasTemperature && hasTopP) {
-      const tempIsDefault = body.temperature === 1.0;
-      const topPIsDefault = body.top_p === 1.0;
-
-      // If both are default, remove top_p (arbitrary choice)
-      if (tempIsDefault && topPIsDefault) {
-        delete body.top_p;
-        Logger.debug('Removed top_p=1.0 from request (both at default, keeping temperature)');
-      }
-      // If only top_p is default, remove it
-      else if (topPIsDefault) {
-        delete body.top_p;
-        Logger.debug(`Removed top_p=1.0 from request (keeping temperature=${body.temperature})`);
-      }
-      // If only temperature is default, remove it and keep top_p
-      else if (tempIsDefault) {
-        delete body.temperature;
-        Logger.debug(`Removed temperature=1.0 from request (keeping top_p=${body.top_p})`);
-      }
-      // If both are non-default, prefer temperature over top_p
-      else {
-        const topPValue = body.top_p;
-        delete body.top_p;
-        Logger.debug(`Removed top_p=${topPValue} from request (preferring temperature=${body.temperature})`);
-      }
-    }
-    // If only top_p is present and it's default, remove it
-    else if (hasTopP && body.top_p === 1.0) {
-      delete body.top_p;
-      Logger.debug('Removed top_p=1.0 from request (default value, no temperature specified)');
-    }
-    // If only temperature is present and it's default, remove it
-    else if (hasTemperature && body.temperature === 1.0) {
-      delete body.temperature;
-      Logger.debug('Removed temperature=1.0 from request (default value, no top_p specified)');
-    }
+      const value = body[param];
+      delete body[param];
+      Logger.debug(`Removed ${param}=${value} from request (deprecated on current models)`);
+    });
 
     return body;
   }
