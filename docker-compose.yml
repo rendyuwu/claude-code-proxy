@@ -2,7 +2,13 @@ services:
   claude-proxy:
     image: node:22-alpine
     working_dir: /app
-    command: sh -c "npm install --only=production 2>/dev/null || true && node server/server.js"
+    # The proxy has no runtime dependencies — package.json declares none and the
+    # server requires only node builtins — so there is nothing to install here.
+    # The install that used to run did have an effect, though: /app is a bind
+    # mount, so --only=production pruned jest, supertest and nock from the host's
+    # node_modules on every container start, and npm test then failed with
+    # "Cannot find module 'nock'" until you reinstalled.
+    command: node server/server.js
     ports:
       - "42069:42069"
     volumes:
