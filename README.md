@@ -65,10 +65,39 @@ host=                            # Leave blank for auto-detect (127.0.0.1 native
 upstream_timeout_ms=300000       # Abort a request to api.anthropic.com after this much socket inactivity
 ```
 
-**Token Priority:**
+**Token Priority** (upstream credential, unrelated to `proxy_api_key` above; step 1 is disabled while the client gate is on):
 1. `x-api-key` header (if provided in requests) - used for that request only, never cached for other clients. If Anthropic rejects it, you get the 401 back instead of the proxy quietly falling back to its own credentials
 2. OAuth tokens from `~/.claude-code-proxy/tokens.json` - refreshed automatically
 3. Claude Code credentials from `~/.claude/.credentials.json` (if fallback enabled) - read-only, never refreshed by the proxy
+
+### Locking Down the Proxy (Client Authentication)
+
+By default the proxy answers anybody who can reach its port, and every request it answers spends your Claude subscription. That is fine on `127.0.0.1`; it is not fine on `host=0.0.0.0`, a VPS, or a Docker port published to the LAN. Set a key:
+
+```
+proxy_api_key=pick-a-long-random-secret   # in server/config.txt
+```
+
+or, equivalently and taking priority over the file:
+
+```bash
+PROXY_API_KEY=pick-a-long-random-secret node server/server.js
+```
+
+Generate one with `openssl rand -hex 32`. With a key set:
+
+- Every `/v1/*` call must present it, as either `Authorization: Bearer <key>` or `x-api-key: <key>`. In SillyTavern this is the "proxy password" field. A wrong or missing key gets `401` with Anthropic's error shape, and nothing is forwarded upstream
+- `/auth/*` still works without the key **from localhost only**, so the browser login flow keeps working. From any other address it needs the key too — `/auth/login` and `/auth/logout` both rewrite the stored tokens. If the proxy is remote, tunnel the port (`ssh -L 42069:localhost:42069 you@host`) and log in through the tunnel. Note that in Docker a browser on the host is *not* loopback as far as the container is concerned, so authenticate before setting the key, or tunnel into the container
+- `/health` stays open for health checks
+- The `x-api-key` bring-your-own-token pass-through (see Token Priority below) is off while the gate is on: a matching `x-api-key` is consumed as the proxy password and never forwarded upstream
+
+Leaving `proxy_api_key` blank keeps the old open behaviour. The comparison is timing-safe, so the key cannot be guessed a character at a time.
+
+For Docker, `docker-compose.yml` passes `PROXY_API_KEY` through from your shell or `.env`:
+
+```bash
+PROXY_API_KEY=$(openssl rand -hex 32) docker-compose up
+```
 
 ### Claude Code Credentials (Legacy Fallback)
 

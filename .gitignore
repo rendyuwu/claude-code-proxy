@@ -12,6 +12,9 @@ coverage/
 # OAuth tokens
 .claude-code-proxy/
 
+# Client API key
+.env
+
 # No token cache needed - reading directly from credentials
 
 # OS generated files

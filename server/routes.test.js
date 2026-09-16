@@ -112,6 +112,94 @@ describe('GET /v1/models', () => {
   });
 });
 
+describe('client API key gate', () => {
+  const KEY = 'sk-proxy-secret';
+
+  beforeEach(() => {
+    process.env.PROXY_API_KEY = KEY;
+  });
+
+  afterEach(() => {
+    delete process.env.PROXY_API_KEY;
+  });
+
+  const upstream = () => nock('https://api.anthropic.com')
+    .post('/v1/messages')
+    .query({ beta: 'true' })
+    .reply(200, JSON.stringify({ id: 'msg_1' }), { 'content-type': 'application/json' });
+
+  it('401s /v1/messages with no key and forwards nothing', async () => {
+    const response = await request(server())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(401);
+    expect(response.body.error.type).toBe('authentication_error');
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('401s a wrong key, including one of the same length', async () => {
+    const response = await request(server())
+      .post('/v1/messages')
+      .set('x-api-key', 'sk-proxy-secreT')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(401);
+  });
+
+  it('accepts Authorization: Bearer', async () => {
+    const scope = upstream();
+
+    const response = await request(server())
+      .post('/v1/messages')
+      .set('Authorization', `Bearer ${KEY}`)
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it('accepts x-api-key and does not spend it upstream as a token', async () => {
+    let sentAuth;
+    const scope = nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        sentAuth = this.req.headers.authorization;
+        return [200, JSON.stringify({ id: 'msg_1' }), { 'content-type': 'application/json' }];
+      });
+
+    const response = await request(server())
+      .post('/v1/messages')
+      .set('x-api-key', KEY)
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(scope.isDone()).toBe(true);
+    // The stored OAuth token, not the proxy password.
+    expect(sentAuth).toBe('Bearer stored-access-token');
+  });
+
+  it('gates /v1/models too', async () => {
+    const response = await request(server()).get('/v1/models');
+
+    expect(response.status).toBe(401);
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('leaves /health open', async () => {
+    const response = await request(server()).get('/health');
+
+    expect(response.status).toBe(200);
+  });
+
+  it('lets a loopback browser reach /auth/status without the key', async () => {
+    const response = await request(server()).get('/auth/status');
+
+    expect(response.status).toBe(200);
+  });
+});
+
 describe('other routes', () => {
   it('serves /health', async () => {
     const response = await request(server()).get('/health');

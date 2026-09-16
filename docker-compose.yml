@@ -11,4 +11,6 @@ services:
       - .:/app
     environment:
       - NODE_ENV=production
+      # Set PROXY_API_KEY in your shell (or .env) to require it from clients.
+      - PROXY_API_KEY=${PROXY_API_KEY:-}
 

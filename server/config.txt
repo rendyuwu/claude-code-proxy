@@ -10,6 +10,8 @@ cloak_tools=true  # Rename the tools your front end declares (suffix _ide) and d
 redact_thinking=false  # On means the beta list matches the CLI byte for byte. Costs only the reasoning text: measured against api.anthropic.com with the proxy out of the path, the same prompt spends the same thinking tokens either way (39 on claude-opus-4-6) and the signature still comes back, so the model thinks exactly as much and only the text is withheld. Set to false if your front end displays reasoning and you want to read it.
 strip_cache_control_ttl=false  # Leave false. Upstream accepts cache_control.ttl, so stripping it downgrades every "1h" breakpoint your front end asks for to the 5m default. Set to true only if Anthropic starts rejecting the field.
 
+proxy_api_key=  # Blank means anyone who can reach this port spends your subscription. Set a secret and clients must send it as `Authorization: Bearer <key>` or `x-api-key: <key>` on /v1/*. The PROXY_API_KEY env var overrides this. /auth/* still works from localhost without the key so the browser login flow keeps working; from anywhere else it needs the key too.
+
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers
 fallback_to_claude_code=true  # Use Claude Code credentials as fallback

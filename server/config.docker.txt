@@ -10,6 +10,8 @@ cloak_tools=true  # Rename the tools your front end declares (suffix _ide) and d
 redact_thinking=false  # Leave false unless you want the CLI's beta list byte for byte. Claude Code sends redact-thinking because it renders reasoning as it streams; upstream answers it with thinking blocks that carry a valid signature and an empty body, so a front end that shows reasoning gets nothing while the thinking tokens are still billed.
 strip_cache_control_ttl=false  # Leave false. Upstream accepts cache_control.ttl, so stripping it downgrades every "1h" breakpoint your front end asks for to the 5m default. Set to true only if Anthropic starts rejecting the field.
 
+proxy_api_key=  # Blank means anyone who can reach this port spends your subscription. Set a secret and clients must send it as `Authorization: Bearer <key>` or `x-api-key: <key>` on /v1/*. The PROXY_API_KEY env var overrides this. /auth/* still works from localhost without the key so the browser login flow keeps working; from anywhere else it needs the key too.
+
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers
 fallback_to_claude_code=true  # Use Claude Code credentials as fallback

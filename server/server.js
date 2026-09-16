@@ -1,5 +1,6 @@
 const http = require('http');
 const url = require('url');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const ClaudeRequest = require('./ClaudeRequest');
@@ -73,6 +74,28 @@ function parseBody(req) {
   });
 }
 
+// Optional gate on the proxy's own clients. Blank key keeps the old open
+// behaviour; a set key means every /v1 call must carry it, because anyone who
+// reaches this port otherwise spends the subscription behind it.
+function proxyApiKey() {
+  return (process.env.PROXY_API_KEY || config.proxy_api_key || '').trim();
+}
+
+function hasValidKey(req, key) {
+  const presented = req.headers['x-api-key'] ||
+    (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const a = Buffer.from(String(presented));
+  const b = Buffer.from(key);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+// Socket address only: x-forwarded-for is client-controlled, so trusting it
+// here would let any remote caller claim to be local.
+function isLoopback(req) {
+  const ip = req.socket.remoteAddress || '';
+  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
 function getClientIP(req) {
   return req.headers['x-forwarded-for'] ||
          req.headers['x-real-ip'] ||
@@ -139,6 +162,28 @@ async function handleRequest(req, res) {
     res.writeHead(200);
     res.end();
     return;
+  }
+
+  const apiKey = proxyApiKey();
+  if (apiKey) {
+    const isAuthRoute = pathname.startsWith('/auth/');
+    // /auth/* is a browser flow that cannot set a header, so it stays reachable
+    // from localhost (tunnel in if the port is remote) but never from off-box
+    // without the key: /auth/login and /auth/logout both overwrite the tokens.
+    const open = !isAuthRoute && !pathname.startsWith('/v1/');
+    if (!open && !hasValidKey(req, apiKey) && !(isAuthRoute && isLoopback(req))) {
+      Logger.warn(`Rejected ${pathname} from ${clientIP}: missing or wrong API key`);
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Invalid or missing API key' }
+      }));
+      return;
+    }
+    // x-api-key otherwise means "use this as the upstream token". With the gate
+    // on it is the proxy's own password, so drop it before ClaudeRequest tries
+    // to spend it at api.anthropic.com and gets a 401 back.
+    if (req.headers['x-api-key'] === apiKey) delete req.headers['x-api-key'];
   }
 
   // OAuth Routes

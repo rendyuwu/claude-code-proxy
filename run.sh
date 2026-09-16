@@ -1,2 +1,2 @@
 #!/bin/bash
-node server/server.js
+node --env-file-if-exists=.env server/server.js
