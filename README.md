@@ -99,6 +99,19 @@ For Docker, `docker-compose.yml` passes `PROXY_API_KEY` through from your shell 
 PROXY_API_KEY=$(openssl rand -hex 32) docker-compose up
 ```
 
+#### Switching the auth routes off entirely
+
+Once the proxy is authenticated, the `/auth/*` routes are dead weight that can only do harm: `/auth/login` and `/auth/callback` replace the stored tokens, `/auth/logout` throws them away. Turn them off and the proxy serves `/v1` traffic only:
+
+```
+auth_routes_enabled=false   # in server/config.txt
+AUTH_ROUTES_ENABLED=false   # or in .env / the environment, which wins
+```
+
+Every `/auth/*` path then answers `404` — from localhost too, and whether or not a key is set, so the routes look like they were never there rather than like something a key would open. `/v1/*` and `/health` are untouched.
+
+Do this only after the proxy has credentials: either its own `~/.claude-code-proxy/tokens.json`, or a mounted `~/.claude` it reads Claude Code's from. To log in again, set it back to `true` and restart. The startup banner says `/auth/* is disabled` while it is off, so a 404 there is never a mystery.
+
 ### Claude Code Credentials (Legacy Fallback)
 
 If you have Claude Code installed, the proxy can use its credentials as a fallback:

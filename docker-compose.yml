@@ -13,4 +13,6 @@ services:
       - NODE_ENV=production
       # Set PROXY_API_KEY in your shell (or .env) to require it from clients.
       - PROXY_API_KEY=${PROXY_API_KEY:-}
+      # AUTH_ROUTES_ENABLED=false stops /auth/* being served at all.
+      - AUTH_ROUTES_ENABLED=${AUTH_ROUTES_ENABLED:-}
 

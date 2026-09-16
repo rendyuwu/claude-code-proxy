@@ -81,6 +81,15 @@ function proxyApiKey() {
   return (process.env.PROXY_API_KEY || config.proxy_api_key || '').trim();
 }
 
+// Off means /auth/* is not served at all: the proxy answers LLM traffic only
+// and the tokens it already holds cannot be replaced or dropped over the
+// network. A deployment that authenticates out of band (mounted Claude Code
+// credentials, a tokens.json written once) never needs those routes exposed.
+function authRoutesEnabled() {
+  const value = process.env.AUTH_ROUTES_ENABLED || config.auth_routes_enabled || 'true';
+  return String(value).trim().toLowerCase() !== 'false';
+}
+
 function hasValidKey(req, key) {
   const presented = req.headers['x-api-key'] ||
     (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -161,6 +170,16 @@ async function handleRequest(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  // 404 rather than 403: a route that is switched off should look like a route
+  // that was never there, and this runs before the key check so a disabled
+  // route never reveals whether a key would have opened it.
+  if (!authRoutesEnabled() && pathname.startsWith('/auth/')) {
+    Logger.debug(`Rejected ${pathname} from ${clientIP}: auth routes disabled`);
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not found' }));
     return;
   }
 
@@ -370,6 +389,12 @@ function startServer() {
     const credentials = ClaudeRequest.describeCredentialSource();
     const authUrl = `http://localhost:${port}/auth/login`;
     const usable = credentials.source !== 'none' && !credentials.expired;
+    // Pointing at /auth/login while it answers 404 would send anyone reading
+    // this banner chasing a route that is switched off.
+    const authRoutes = authRoutesEnabled();
+    const loginHint = authRoutes
+      ? `visit ${authUrl}`
+      : 'set AUTH_ROUTES_ENABLED=true and restart to reach /auth/login';
 
     Logger.info('');
     Logger.info('Authentication Status:');
@@ -378,18 +403,22 @@ function startServer() {
     } else if (credentials.source === 'claude-code' && !credentials.expired) {
       const until = credentials.expiresAt ? ` until ${credentials.expiresAt.toLocaleString()}` : '';
       Logger.info(`  ✓ Using Claude Code credentials (read-only)${until}`);
-      Logger.info(`  → Run Claude Code to refresh them, or visit ${authUrl} to give the proxy its own tokens`);
+      Logger.info(`  → Run Claude Code to refresh them, or ${loginHint} to give the proxy its own tokens`);
     } else if (credentials.source === 'claude-code') {
       Logger.info('  ✗ Claude Code credentials found but expired');
-      Logger.info(`  → Run Claude Code once to refresh them, or visit ${authUrl} to authenticate the proxy`);
+      Logger.info(`  → Run Claude Code once to refresh them, or ${loginHint} to authenticate the proxy`);
     } else {
       Logger.info('  ✗ Not authenticated');
-      Logger.info(`  → Visit ${authUrl} to authenticate`);
+      Logger.info(`  → To authenticate, ${loginHint}`);
+    }
+
+    if (!authRoutes) {
+      Logger.info('  ℹ /auth/* is disabled; this proxy serves /v1 traffic only');
     }
 
     // Auto-open browser if configured (only works when running natively)
     const autoOpenBrowser = config.auto_open_browser !== 'false';
-    if (!usable && autoOpenBrowser && !isRunningInDocker()) {
+    if (!usable && authRoutes && autoOpenBrowser && !isRunningInDocker()) {
       Logger.info('  → Opening browser for authentication...');
       setTimeout(() => openBrowser(authUrl), 1000);
     }

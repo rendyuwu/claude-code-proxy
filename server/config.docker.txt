@@ -11,6 +11,7 @@ redact_thinking=false  # Leave false unless you want the CLI's beta list byte fo
 strip_cache_control_ttl=false  # Leave false. Upstream accepts cache_control.ttl, so stripping it downgrades every "1h" breakpoint your front end asks for to the 5m default. Set to true only if Anthropic starts rejecting the field.
 
 proxy_api_key=  # Blank means anyone who can reach this port spends your subscription. Set a secret and clients must send it as `Authorization: Bearer <key>` or `x-api-key: <key>` on /v1/*. The PROXY_API_KEY env var overrides this. /auth/* still works from localhost without the key so the browser login flow keeps working; from anywhere else it needs the key too.
+auth_routes_enabled=true  # Set to false to stop serving /auth/* entirely: login, callback, status and logout all answer 404, and the proxy handles /v1 traffic only. Use it once the proxy is authenticated (or gets its credentials from a mounted ~/.claude), so nothing reachable over the network can replace or drop the tokens it holds. The AUTH_ROUTES_ENABLED env var overrides this. Turn it back on and restart when you need to log in again.
 
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers

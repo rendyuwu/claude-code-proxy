@@ -26,6 +26,7 @@ jest.mock('./OAuthManager', () => ({
   logout: jest.fn()
 }));
 
+const OAuthManager = require('./OAuthManager');
 const { handleRequest } = require('./server');
 
 const SONNET = 'claude-sonnet-4-5-20250929';
@@ -197,6 +198,63 @@ describe('client API key gate', () => {
     const response = await request(server()).get('/auth/status');
 
     expect(response.status).toBe(200);
+  });
+});
+
+describe('auth routes switch', () => {
+  afterEach(() => {
+    delete process.env.AUTH_ROUTES_ENABLED;
+    delete process.env.PROXY_API_KEY;
+  });
+
+  it('serves /auth/* by default', async () => {
+    const response = await request(server()).get('/auth/status');
+
+    expect(response.status).toBe(200);
+  });
+
+  it('404s every /auth route when disabled, loopback included', async () => {
+    process.env.AUTH_ROUTES_ENABLED = 'false';
+
+    for (const route of ['/auth/status', '/auth/login', '/auth/get-url', '/auth/logout']) {
+      const response = await request(server()).get(route);
+
+      expect(response.status).toBe(404);
+      expect(response.body.error).toBe('Not found');
+    }
+  });
+
+  it('does not log out when disabled', async () => {
+    process.env.AUTH_ROUTES_ENABLED = 'false';
+
+    await request(server()).get('/auth/logout');
+
+    expect(OAuthManager.logout).not.toHaveBeenCalled();
+  });
+
+  it('404s rather than 401s when the key gate is also on', async () => {
+    process.env.AUTH_ROUTES_ENABLED = 'false';
+    process.env.PROXY_API_KEY = 'sk-proxy-secret';
+
+    const response = await request(server()).get('/auth/status');
+
+    // 401 would confirm the route exists behind a key.
+    expect(response.status).toBe(404);
+  });
+
+  it('keeps serving /v1 when auth routes are off', async () => {
+    process.env.AUTH_ROUTES_ENABLED = 'false';
+    const scope = nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, JSON.stringify({ id: 'msg_1' }), { 'content-type': 'application/json' });
+
+    const response = await request(server())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(scope.isDone()).toBe(true);
   });
 });
 
