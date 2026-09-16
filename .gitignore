@@ -31,3 +31,6 @@ Thumbs.db
 *.log
 
 .claude
+
+# oh-my-claudecode local state
+.omc/
