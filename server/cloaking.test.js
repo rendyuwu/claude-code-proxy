@@ -105,6 +105,37 @@ describe('applyCloaking', () => {
     expect(body.system.filter(block => block.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
   });
 
+  // A client that regenerates cc_version/cch per request puts a value that
+  // changes every turn inside the cached prefix, which costs a full cache write
+  // per turn. Only the derived block, stable across turns, may survive.
+  it('replaces a billing block the client rotates per request', () => {
+    const turn = (cch) => applyCloaking(bodyWith({
+      system: [
+        { type: 'text', text: `${BILLING_PREFIX} cc_version=2.1.257.abc; cc_entrypoint=cli; cch=${cch};` },
+        { type: 'text', text: 'You are Claude Code, Anthropic\'s official CLI for Claude.' }
+      ]
+    }), OAT);
+
+    const first = turn('aaaaa');
+    const second = turn('bbbbb');
+
+    expect(first.system.filter(block => block.text.startsWith(BILLING_PREFIX))).toHaveLength(1);
+    expect(first.system).toEqual(second.system);
+    expect(first.metadata.user_id).toBe(second.metadata.user_id);
+  });
+
+  it('keeps a billing block that carries the cache breakpoint', () => {
+    const body = applyCloaking(bodyWith({
+      system: [{
+        type: 'text',
+        text: `${BILLING_PREFIX} cc_version=2.1.257.abc; cc_entrypoint=cli; cch=aaaaa;`,
+        cache_control: { type: 'ephemeral' }
+      }]
+    }), OAT);
+
+    expect(body.system.filter(block => block.cache_control)).toHaveLength(1);
+  });
+
   it('leaves a user_id the client supplied', () => {
     const body = applyCloaking(bodyWith({ metadata: { user_id: 'mine' } }), OAT);
 

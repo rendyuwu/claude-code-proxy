@@ -59,9 +59,22 @@ function conversationSeed(body) {
   });
 }
 
-function hasBillingBlock(system) {
-  return Array.isArray(system) && typeof system[0]?.text === 'string'
-    && system[0].text.startsWith(BILLING_PREFIX);
+// A front end that talks to the proxy may send a billing block of its own, and
+// some of them regenerate the build hash and cch on every single request. That
+// block sits inside the cached prefix, so a value that changes per turn is a
+// cache miss on every turn and re-bills the whole conversation as a write. The
+// client's block is dropped and the derived one used instead, which is the only
+// version that stays byte-identical across the turns of a chat.
+//
+// A block carrying cache_control is left alone: it marks the end of a cached
+// prefix, and removing it would silently drop a breakpoint the client paid for.
+function stripBillingBlocks(system) {
+  if (!Array.isArray(system)) return [];
+  return system.filter(block => !(
+    typeof block?.text === 'string'
+    && block.text.startsWith(BILLING_PREFIX)
+    && !block.cache_control
+  ));
 }
 
 /**
@@ -74,12 +87,14 @@ function hasBillingBlock(system) {
 function applyCloaking(body, token) {
   if (!body || !isOAuthToken(token)) return body;
 
+  // Stripped before the seed is taken: a rotating billing block in the system
+  // array would otherwise make session_id change every turn too, so one chat
+  // would look like a hundred one-message sessions.
+  body.system = stripBillingBlocks(body.system);
+
   const seed = conversationSeed(body);
 
-  if (!hasBillingBlock(body.system)) {
-    const billingBlock = { type: 'text', text: buildBillingHeader(token) };
-    body.system = Array.isArray(body.system) ? [billingBlock, ...body.system] : [billingBlock];
-  }
+  body.system = [{ type: 'text', text: buildBillingHeader(token) }, ...body.system];
 
   // A client that sends its own user_id knows something we do not; leave it.
   if (!body.metadata?.user_id) {
