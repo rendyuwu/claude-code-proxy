@@ -7,7 +7,7 @@ const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const { redactHeaders } = require('./redact');
-const { applyCloaking, cloakTools, decloakToolNames, isOAuthToken } = require('./cloaking');
+const { applyCloaking, cloakTools, decloakToolNames, isOAuthToken, CLAUDE_CLI_VERSION } = require('./cloaking');
 const SseToolNameRewriter = require('./SseToolNameRewriter');
 
 // Load configuration
@@ -67,8 +67,9 @@ const REDACT_THINKING = CONFIG.redact_thinking === true; // Default to false
 // The proxy speaks to api.anthropic.com with a Claude Code subscription token,
 // so it identifies itself the way the CLI that owns that token does. A
 // User-Agent of "claude-code-proxy" on an OAuth credential is a mismatch no
-// real client produces.
-const CLAUDE_CLI_VERSION = '2.1.258';
+// real client produces. CLAUDE_CLI_VERSION lives in cloaking.js, which stamps
+// the same number into the billing header; two copies meant a bump could land
+// in one place and leave the other behind.
 
 const STAINLESS_OS = {
   darwin: 'MacOS',

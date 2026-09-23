@@ -1,9 +1,15 @@
 const crypto = require('crypto');
 
-// Claude Code 2.1.258 sends a billing header as the first system block and a
+// Claude Code 2.1.280 sends a billing header as the first system block and a
 // JSON-shaped metadata.user_id alongside it. Both are reproduced here so a
 // request carrying a subscription token looks like the client that owns it.
-const CLAUDE_CLI_VERSION = '2.1.258';
+//
+// Single source of truth for the version: ClaudeRequest imports it from here
+// for the User-Agent too. Upstream gates new models on this number and answers
+// claude_code_version_too_old when it is behind the release the model shipped
+// in (claude-opus-5-5 requires 2.1.280, claude-fable-5-1 required 2.1.251), so
+// it has to be bumped as the CLI is.
+const CLAUDE_CLI_VERSION = '2.1.280';
 const CC_ENTRYPOINT = 'sdk-cli';
 
 const BILLING_PREFIX = 'x-anthropic-billing-header:';
