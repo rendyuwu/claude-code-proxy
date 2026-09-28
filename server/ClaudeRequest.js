@@ -109,6 +109,11 @@ class ClaudeRequest {
     ];
   }
 
+  // The CLI appends this beta only when its thinking config carries
+  // block_binding, and upstream rejects block_binding without it. LibreChat
+  // sends block_binding on every claude-opus-5-5 request.
+  static THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
   constructor(req = null) {
     this.API_URL = 'https://api.anthropic.com/v1/messages?beta=true';
     this.VERSION = '2023-06-01';
@@ -293,7 +298,7 @@ class ClaudeRequest {
     }
   }
 
-  getHeaders(token, { stream = false } = {}) {
+  getHeaders(token, { stream = false, thinkingBinding = false } = {}) {
     const headers = {
       'Content-Type': 'application/json',
       'Authorization': token,
@@ -324,7 +329,9 @@ class ClaudeRequest {
     }
 
     if (this.BETA_HEADER) {
-      headers['anthropic-beta'] = this.BETA_HEADER;
+      headers['anthropic-beta'] = thinkingBinding
+        ? `${this.BETA_HEADER},${ClaudeRequest.THINKING_BINDING_BETA}`
+        : this.BETA_HEADER;
     }
 
     return headers;
@@ -519,7 +526,10 @@ class ClaudeRequest {
 
   async makeRequest(body, presetName = null, tokenOverride = null) {
     const token = tokenOverride || await this.getAuthToken();
-    const headers = this.getHeaders(token, { stream: body?.stream === true });
+    const headers = this.getHeaders(token, {
+      stream: body?.stream === true,
+      thinkingBinding: body?.thinking?.block_binding !== undefined
+    });
     const processedBody = this.processRequestBody(body, presetName, token);
 
     Logger.debug('Outgoing headers to Claude:', JSON.stringify(redactHeaders(headers), null, 2));

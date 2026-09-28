@@ -531,6 +531,28 @@ describe('client identity headers', () => {
 
     expect(scope.isDone()).toBe(true);
   });
+
+  it('adds the thinking-binding beta only when the body carries block_binding', async () => {
+    const sentBetas = [];
+    const thinking = { type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
+
+    for (const body of [{ thinking }, {}]) {
+      nock('https://api.anthropic.com')
+        .post('/v1/messages')
+        .query({ beta: 'true' })
+        .reply(function () {
+          sentBetas.push(this.req.headers['anthropic-beta'].split(','));
+          return [200, { ok: true }];
+        });
+
+      await request(messagesServer())
+        .post('/v1/messages')
+        .send({ model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'hi' }], ...body });
+    }
+
+    expect(sentBetas[0]).toEqual([...ClaudeRequest.betaFlags(), 'thinking-binding-controls-2026-08-01']);
+    expect(sentBetas[1]).toEqual(ClaudeRequest.betaFlags());
+  });
 });
 
 describe('CLI request fingerprint', () => {
