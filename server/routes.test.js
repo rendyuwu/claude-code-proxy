@@ -1,6 +1,7 @@
 // Route-level tests that drive the real handleRequest from server.js, rather
 // than a copy of its logic.
 const http = require('http');
+const fs = require('fs');
 const nock = require('nock');
 const request = require('supertest');
 
@@ -220,6 +221,67 @@ describe('client API key gate', () => {
     const response = await request(server()).get('/auth/status');
 
     expect(response.status).toBe(200);
+  });
+});
+
+describe('Docker host browser', () => {
+  const KEY = 'sk-proxy-secret';
+  const GATEWAY = '172.21.0.1';
+  const ROUTE_TABLE = [
+    'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT',
+    'eth0\t08080808\t010A0A0A\t0007\t0\t0\t0\tFFFFFFFF\t0\t0\t0',
+    'eth0\t00000000\t010015AC\t0003\t0\t0\t0\t00000000\t0\t0\t0',
+    ''
+  ].join('\n');
+
+  const realFs = jest.requireActual('fs');
+
+  // Only the socket address is faked: the request still goes through the real
+  // handleRequest, so this covers the key gate itself, not a copy of it.
+  const serverAs = (remoteAddress) => http.createServer((req, res) => {
+    Object.defineProperty(req.socket, 'remoteAddress', { value: remoteAddress, configurable: true });
+    handleRequest(req, res);
+  });
+
+  const setInDocker = (running) => {
+    jest.spyOn(fs, 'existsSync')
+      .mockImplementation(file => (file === '/.dockerenv' ? running : realFs.existsSync(file)));
+    jest.spyOn(fs, 'readFileSync').mockImplementation((file, encoding) => {
+      if (file === '/proc/net/route') return ROUTE_TABLE;
+      if (file === '/proc/self/cgroup') return '0::/init.scope';
+      return realFs.readFileSync(file, encoding);
+    });
+  };
+
+  beforeEach(() => {
+    process.env.PROXY_API_KEY = KEY;
+    setInDocker(true);
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    delete process.env.PROXY_API_KEY;
+  });
+
+  it('serves /auth/login to a browser on the host without the key', async () => {
+    const response = await request(serverAs(GATEWAY)).get('/auth/login');
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('text/html');
+  });
+
+  it('still gates a LAN address that is not the gateway', async () => {
+    const response = await request(serverAs('192.168.1.50')).get('/auth/status');
+
+    expect(response.status).toBe(401);
+  });
+
+  it('gates the gateway address when not running in Docker', async () => {
+    setInDocker(false);
+
+    const response = await request(serverAs(GATEWAY)).get('/auth/status');
+
+    expect(response.status).toBe(401);
   });
 });
 

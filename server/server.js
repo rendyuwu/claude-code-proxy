@@ -98,11 +98,33 @@ function hasValidKey(req, key) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// The default route's gateway. Inside a container that is the host's address
+// on the Docker bridge, which is where a browser on the host arrives from.
+function defaultGateway() {
+  try {
+    const lines = fs.readFileSync('/proc/net/route', 'utf8').split('\n').slice(1);
+    for (const line of lines) {
+      const [, destination, gateway, flags] = line.trim().split(/\s+/);
+      if (destination !== '00000000' || !(parseInt(flags, 16) & 0x2)) continue;
+      // The kernel prints the address little-endian, one byte per pair.
+      return gateway.match(/../g).reverse().map(byte => parseInt(byte, 16)).join('.');
+    }
+  } catch (error) {
+    // Not Linux, or /proc is not mounted: no gateway to trust.
+  }
+  return null;
+}
+
 // Socket address only: x-forwarded-for is client-controlled, so trusting it
 // here would let any remote caller claim to be local.
 function isLoopback(req) {
-  const ip = req.socket.remoteAddress || '';
-  return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  // A browser on the Docker host is not loopback to the container: the
+  // published port arrives from the bridge gateway. That gateway is the host,
+  // so the login flow works there; LAN callers keep their own source address
+  // and still need the key.
+  return isRunningInDocker() && ip === defaultGateway();
 }
 
 // Destructive /auth/* mutations are reachable from any local page if a browser
