@@ -327,6 +327,170 @@ describe('OAuthManager', () => {
     });
   });
 
+  describe('manual account management', () => {
+    it('skips a disabled account during failover until activated', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+
+      OAuthManager.disableAccount(a.id);
+      expect(OAuthManager.getActiveAccount().id).toBe(b.id);
+
+      // A limit that has expired makes A eligible again, but not while it is
+      // disabled by hand.
+      const state = readState();
+      state.accounts[0].limited_until = Date.now() - 1000;
+      OAuthManager.saveState(state);
+      expect(OAuthManager.getActiveAccount().id).toBe(b.id);
+
+      OAuthManager.disableAccount(b.id);
+      expect(OAuthManager.getActiveAccount()).toBeNull();
+      expect(OAuthManager.getStatus().all_disabled).toBe(true);
+    });
+
+    it('disabling the active account advances to the next usable account and persists', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      expect(readState().active_account_id).toBe(a.id);
+
+      const status = OAuthManager.disableAccount(a.id);
+
+      expect(status.active_account_id).toBe(b.id);
+      expect(status.accounts.find(x => x.id === a.id).disabled).toBe(true);
+
+      const stored = readState();
+      expect(stored.active_account_id).toBe(b.id);
+      expect(stored.accounts.find(x => x.id === a.id).disabled).toBe(true);
+    });
+
+    it('activating an account clears disabled and makes it active', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      OAuthManager.disableAccount(a.id);
+      expect(readState().active_account_id).toBe(b.id);
+
+      const status = OAuthManager.activateAccount(a.id);
+
+      expect(status.active_account_id).toBe(a.id);
+      expect(status.accounts.find(x => x.id === a.id)).toMatchObject({
+        active: true,
+        disabled: false
+      });
+
+      const stored = readState();
+      expect(stored.active_account_id).toBe(a.id);
+      expect(stored.accounts.find(x => x.id === a.id).disabled).toBe(false);
+    });
+
+    it('deleting a non-active account keeps the active account', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      const c = addAccount('c');
+
+      const status = OAuthManager.deleteAccount(b.id);
+
+      expect(status.accounts).toHaveLength(2);
+      expect(status.active_account_id).toBe(a.id);
+      expect(status.accounts.some(x => x.id === b.id)).toBe(false);
+      expect(readState().accounts.map(x => x.id)).toEqual([a.id, c.id]);
+    });
+
+    it('deleting the active account advances or clears the pointer', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+
+      expect(OAuthManager.deleteAccount(a.id).active_account_id).toBe(b.id);
+
+      const status = OAuthManager.deleteAccount(b.id);
+      expect(status.accounts).toEqual([]);
+      expect(status.active_account_id).toBeNull();
+      expect(OAuthManager.isAuthenticated()).toBe(false);
+    });
+
+    it('returns null and writes nothing for unknown ids', () => {
+      addAccount('a');
+      const before = fs.readFileSync(STATE_PATH);
+
+      expect(OAuthManager.disableAccount('nope')).toBeNull();
+      expect(OAuthManager.activateAccount('nope')).toBeNull();
+      expect(OAuthManager.deleteAccount('nope')).toBeNull();
+
+      expect(fs.readFileSync(STATE_PATH).equals(before)).toBe(true);
+    });
+
+    it('reports disabled and all_disabled in sanitized status', () => {
+      const a = addAccount('a');
+      OAuthManager.disableAccount(a.id);
+
+      const status = OAuthManager.getStatus();
+      expect(status.all_disabled).toBe(true);
+      expect(status.accounts[0]).toMatchObject({ id: a.id, disabled: true, active: false });
+      expect(JSON.stringify(status.accounts)).not.toContain('token-a');
+      expect(JSON.stringify(status.accounts)).not.toContain('refresh-a');
+    });
+
+    it('keeps an account disabled across a re-login', () => {
+      const a = addAccount('a');
+      OAuthManager.disableAccount(a.id);
+      expect(readState().active_account_id).toBeNull();
+
+      const tokens = tokensFor('a');
+      tokens.access_token = 'token-a-new';
+      tokens.refresh_token = 'refresh-a-new';
+      const relogged = OAuthManager.addAccount(tokens, identityFor('a'));
+
+      expect(relogged).toMatchObject({ id: a.id, disabled: true, active: false });
+      expect(OAuthManager.getStatus().active_account_id).toBeNull();
+
+      const stored = readState().accounts.find(x => x.id === a.id);
+      expect(stored.disabled).toBe(true);
+      expect(stored.access_token).toBe('token-a-new');
+    });
+
+    it('treats a legacy account with no disabled field as enabled', () => {
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      fs.writeFileSync(STATE_PATH, JSON.stringify({
+        active_account_id: 'legacy',
+        accounts: [{
+          id: 'legacy',
+          label: 'legacy@example.com',
+          email: 'legacy@example.com',
+          account_uuid: 'uuid-legacy',
+          organization_uuid: 'org-legacy',
+          access_token: 'token-legacy',
+          refresh_token: 'refresh-legacy',
+          expires_at: Date.now() + 3600000,
+          limited_until: null,
+          limited_reason: null,
+          last_limit_at: null,
+          created_at: 1
+        }]
+      }, null, 2), { mode: 0o600 });
+
+      expect(OAuthManager.getActiveAccount().id).toBe('legacy');
+
+      const status = OAuthManager.getStatus();
+      expect(status.all_disabled).toBe(false);
+      expect(status.accounts[0]).toMatchObject({ id: 'legacy', disabled: false, active: true });
+    });
+
+    it('activating a limited account switches the pointer but selection skips it', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      addAccount('c');
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: Date.now() + 60000 });
+      expect(readState().active_account_id).toBe(b.id);
+
+      const status = OAuthManager.activateAccount(a.id);
+
+      expect(status.active_account_id).toBe(a.id);
+      expect(status.accounts.find(x => x.id === a.id)).toMatchObject({ active: true, limited: true });
+
+      // Activation does not clear the limit, so the next selection advances.
+      expect(OAuthManager.getActiveAccount().id).toBe(b.id);
+      expect(readState().active_account_id).toBe(b.id);
+    });
+  });
+
   describe('markAccountLimited', () => {
     it('uses an explicit future reset time', () => {
       const a = addAccount('a');

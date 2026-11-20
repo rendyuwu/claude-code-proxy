@@ -42,6 +42,9 @@ jest.mock('./OAuthManager', () => ({
   buildAuthorizationURL: jest.fn(),
   exchangeCodeForTokens: jest.fn(),
   addAccountFromTokenResponse: jest.fn().mockResolvedValue({ id: 'acct-1', label: 'Account 1' }),
+  disableAccount: jest.fn(() => ({ accounts: [] })),
+  activateAccount: jest.fn(() => ({ accounts: [] })),
+  deleteAccount: jest.fn(() => ({ accounts: [] })),
   logout: jest.fn()
 }));
 
@@ -235,12 +238,18 @@ describe('auth routes switch', () => {
   it('404s every /auth route when disabled, loopback included', async () => {
     process.env.AUTH_ROUTES_ENABLED = 'false';
 
-    for (const route of ['/auth/status', '/auth/login', '/auth/get-url', '/auth/logout']) {
+    for (const route of ['/auth/status', '/auth/accounts', '/auth/login', '/auth/get-url', '/auth/logout']) {
       const response = await request(server()).get(route);
 
       expect(response.status).toBe(404);
       expect(response.body.error).toBe('Not found');
     }
+
+    // The account mutations live under /auth/* too, so they are just as gone.
+    const mutation = await request(server()).post('/auth/accounts/x/disable');
+
+    expect(mutation.status).toBe(404);
+    expect(OAuthManager.disableAccount).not.toHaveBeenCalled();
   });
 
   it('does not log out when disabled', async () => {
@@ -274,6 +283,68 @@ describe('auth routes switch', () => {
 
     expect(response.status).toBe(200);
     expect(scope.isDone()).toBe(true);
+  });
+});
+
+describe('account management routes', () => {
+  it('rejects a cross-origin mutation and calls nothing', async () => {
+    const response = await request(server())
+      .post('/auth/accounts/x/disable')
+      .set('Origin', 'http://evil.example');
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: 'Cross-origin request rejected' });
+    expect(OAuthManager.disableAccount).not.toHaveBeenCalled();
+  });
+
+  it('accepts a same-origin mutation and one with no Origin header', async () => {
+    const sameOrigin = await request(server())
+      .post('/auth/accounts/x/disable')
+      .set('Host', 'proxy.test')
+      .set('Origin', 'http://proxy.test');
+
+    expect(sameOrigin.status).toBe(200);
+    expect(sameOrigin.body.accounts).toHaveLength(1);
+
+    const headerless = await request(server()).post('/auth/accounts/x/disable');
+
+    expect(headerless.status).toBe(200);
+    expect(OAuthManager.disableAccount).toHaveBeenCalledTimes(2);
+    expect(OAuthManager.disableAccount).toHaveBeenCalledWith('x');
+  });
+
+  it('404s a malformed account id instead of calling the manager', async () => {
+    const response = await request(server()).post('/auth/accounts/%ZZ/disable');
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Account not found' });
+    expect(OAuthManager.disableAccount).not.toHaveBeenCalled();
+  });
+
+  it('500s with a JSON body when the manager throws', async () => {
+    OAuthManager.disableAccount.mockImplementationOnce(() => {
+      throw new Error('disk full');
+    });
+
+    const response = await request(server()).post('/auth/accounts/x/disable');
+
+    expect(response.status).toBe(500);
+    expect(response.headers['content-type']).toContain('application/json');
+    expect(response.body).toEqual({ error: 'Failed to update account' });
+  });
+
+  it('404s an unknown account and reports the manager status otherwise', async () => {
+    OAuthManager.deleteAccount.mockReturnValueOnce(null);
+
+    const missing = await request(server()).delete('/auth/accounts/x');
+
+    expect(missing.status).toBe(404);
+    expect(missing.body).toEqual({ error: 'Account not found' });
+
+    const deleted = await request(server()).delete('/auth/accounts/x');
+
+    expect(deleted.status).toBe(200);
+    expect(OAuthManager.deleteAccount).toHaveBeenCalledTimes(2);
   });
 });
 

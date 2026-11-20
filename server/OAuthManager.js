@@ -421,15 +421,17 @@ class OAuthManager {
         limited_until: null,
         limited_reason: null,
         last_limit_at: null,
+        disabled: false,
         created_at: now
       };
       state.accounts.push(account);
     }
 
     // A login only claims the active slot when nobody healthy holds it, so
-    // adding an account never moves traffic off the account already in use.
+    // adding an account never moves traffic off the account already in use,
+    // and a disabled account never becomes active by being logged in again.
     const activeExists = state.accounts.some(a => a.id === state.active_account_id);
-    if (!state.active_account_id || !activeExists) {
+    if (!account.disabled && (!state.active_account_id || !activeExists)) {
       state.active_account_id = account.id;
     }
 
@@ -480,6 +482,7 @@ class OAuthManager {
       limited_until: limited ? account.limited_until : null,
       limited,
       limited_reason: limited ? (account.limited_reason ?? null) : null,
+      disabled: !!account.disabled,
       active: account.id === activeAccountId
     };
   }
@@ -491,7 +494,7 @@ class OAuthManager {
   /**
    * Move the active pointer to the next usable account, scanning circularly
    * from just after fromId, and return it. Mutates state only.
-   * @returns {Object|null} null when every account is limited
+   * @returns {Object|null} null when every account is limited or disabled
    */
   _advanceActive(state, fromId, now) {
     const accounts = state.accounts;
@@ -501,7 +504,7 @@ class OAuthManager {
     const start = fromId ? accounts.findIndex(a => a.id === fromId) : -1;
     for (let step = 1; step <= count; step += 1) {
       const account = accounts[((start + step) % count + count) % count];
-      if (!this._isLimited(account, now)) {
+      if (!account.disabled && !this._isLimited(account, now)) {
         state.active_account_id = account.id;
         return account;
       }
@@ -520,7 +523,7 @@ class OAuthManager {
     const state = this.loadState();
     const active = state.accounts.find(a => a.id === state.active_account_id);
 
-    if (active && !this._isLimited(active, now)) {
+    if (active && !active.disabled && !this._isLimited(active, now)) {
       return active;
     }
 
@@ -555,7 +558,7 @@ class OAuthManager {
     // A late 429 for an account that already lost the slot must not move the
     // pointer past the account now serving traffic.
     const active = state.accounts.find(a => a.id === state.active_account_id);
-    const activeUsable = active && active.id !== accountId && !this._isLimited(active, now);
+    const activeUsable = active && active.id !== accountId && !active.disabled && !this._isLimited(active, now);
 
     const next = activeUsable
       ? active
@@ -563,6 +566,64 @@ class OAuthManager {
 
     this.saveState(state);
     return next;
+  }
+
+  /**
+   * Take one account out of selection until it is activated again, moving the
+   * active pointer off it when it held the slot.
+   * @param {string} accountId
+   * @returns {Object|null} status after the change, null for an unknown id
+   */
+  disableAccount(accountId) {
+    const now = Date.now();
+    const state = this.loadState();
+    const account = state.accounts.find(a => a.id === accountId);
+    if (!account) return null;
+
+    account.disabled = true;
+    if (state.active_account_id === accountId) {
+      state.active_account_id = null;
+      this._advanceActive(state, null, now); // null leaves active_account_id null
+    }
+    this.saveState(state);
+    return this.getStatus();
+  }
+
+  /**
+   * Clear the disabled flag and hand this account the active slot. A recorded
+   * rate limit is left alone: the next request skips it and advances.
+   * @param {string} accountId
+   * @returns {Object|null} status after the change, null for an unknown id
+   */
+  activateAccount(accountId) {
+    const state = this.loadState();
+    const account = state.accounts.find(a => a.id === accountId);
+    if (!account) return null;
+
+    account.disabled = false;
+    state.active_account_id = account.id;
+    this.saveState(state);
+    return this.getStatus();
+  }
+
+  /**
+   * Remove one account, advancing the pointer when it names an account that is
+   * no longer there.
+   * @param {string} accountId
+   * @returns {Object|null} status after the change, null for an unknown id
+   */
+  deleteAccount(accountId) {
+    const state = this.loadState();
+    const index = state.accounts.findIndex(a => a.id === accountId);
+    if (index === -1) return null;
+
+    state.accounts.splice(index, 1);
+    if (!state.accounts.some(a => a.id === state.active_account_id)) {
+      state.active_account_id = null;
+      this._advanceActive(state, null, Date.now());
+    }
+    this.saveState(state);
+    return this.getStatus();
   }
 
   _updateAccount(accountId, patch) {
@@ -596,6 +657,7 @@ class OAuthManager {
       authenticated: state.accounts.some(a => a.access_token && a.refresh_token),
       active_account_id: state.active_account_id ?? null,
       all_limited: accounts.length > 0 && accounts.every(a => a.limited),
+      all_disabled: accounts.length > 0 && accounts.every(a => a.disabled),
       earliest_reset_at: earliestResetAt,
       accounts
     };

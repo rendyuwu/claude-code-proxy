@@ -275,6 +275,11 @@ class ClaudeRequest {
       if (OAuthManager.isAuthenticated()) {
         const account = OAuthManager.getActiveAccount();
         if (!account) {
+          // Disabled is not a limit: retrying will not clear it, so it is a
+          // 401 the user acts on rather than a 429 the client retries.
+          if (OAuthManager.getStatus().all_disabled) {
+            throw this.authError('All OAuth accounts are disabled; activate one at /auth/accounts');
+          }
           throw this.rateLimitError(OAuthManager.accountCount(), OAuthManager.getEarliestResetMs());
         }
 
@@ -469,6 +474,7 @@ class ClaudeRequest {
         activeLabel: active ? active.label : null,
         expiresAt: active && active.expires_at ? new Date(active.expires_at) : null,
         allLimited: status.all_limited,
+        allDisabled: status.all_disabled,
         earliestResetAt: status.earliest_reset_at ? new Date(status.earliest_reset_at) : null,
         expired: false
       };

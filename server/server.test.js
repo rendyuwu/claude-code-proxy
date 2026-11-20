@@ -249,6 +249,147 @@ describe('GET /auth/status', () => {
   });
 });
 
+describe('account management routes', () => {
+  const SONNET = 'claude-sonnet-4-5-20250929';
+
+  const addAccount = (suffix) => OAuthManager.addAccount({
+    access_token: `token-${suffix}`,
+    refresh_token: `refresh-${suffix}`,
+    expires_at: Date.now() + 3600000
+  }, {
+    account_uuid: `uuid-${suffix}`,
+    organization_uuid: `org-${suffix}`,
+    email: `${suffix}@example.com`
+  });
+
+  it('serves the management page', async () => {
+    const response = await request(server()).get('/auth/accounts');
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('text/html');
+    expect(response.text).toContain('OAuth Accounts');
+  });
+
+  it('disables the active account and reports the next one', async () => {
+    const a = addAccount('a');
+    const b = addAccount('b');
+
+    const response = await request(server()).post(`/auth/accounts/${a.id}/disable`);
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('application/json');
+    expect(response.body.active_account_id).toBe(b.id);
+    expect(response.body.accounts.find(x => x.id === a.id).disabled).toBe(true);
+    expect(response.body.accounts.find(x => x.id === a.id).active).toBe(false);
+
+    // Same payload shape as /auth/status, timestamps included.
+    const active = response.body.accounts.find(x => x.id === b.id);
+    expect(new Date(active.expires_at).toISOString()).toBe(active.expires_at);
+    expect(active.limited_until).toBeNull();
+
+    const status = await request(server()).get('/auth/status');
+    expect(status.body.active_account_id).toBe(b.id);
+    expect(status.body.accounts.find(x => x.id === a.id).disabled).toBe(true);
+  });
+
+  it('activates an account', async () => {
+    const a = addAccount('a');
+    addAccount('b');
+    await request(server()).post(`/auth/accounts/${a.id}/disable`);
+
+    const response = await request(server()).post(`/auth/accounts/${a.id}/activate`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.active_account_id).toBe(a.id);
+    expect(response.body.accounts.find(x => x.id === a.id)).toMatchObject({
+      active: true,
+      disabled: false
+    });
+  });
+
+  it('deletes one account and keeps the active one', async () => {
+    const a = addAccount('a');
+    const b = addAccount('b');
+
+    const response = await request(server()).delete(`/auth/accounts/${b.id}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.accounts).toHaveLength(1);
+    expect(response.body.accounts[0].id).toBe(a.id);
+    expect(response.body.active_account_id).toBe(a.id);
+    expect(OAuthManager.loadState().accounts).toHaveLength(1);
+  });
+
+  it('404s an unknown id on every mutation', async () => {
+    addAccount('a');
+
+    for (const path of [
+      '/auth/accounts/nope/disable',
+      '/auth/accounts/nope/activate'
+    ]) {
+      const response = await request(server()).post(path);
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: 'Account not found' });
+    }
+
+    const deleted = await request(server()).delete('/auth/accounts/nope');
+
+    expect(deleted.status).toBe(404);
+    expect(deleted.body).toEqual({ error: 'Account not found' });
+    expect(OAuthManager.accountCount()).toBe(1);
+  });
+
+  it('reports a junk stored timestamp as null instead of failing the request', async () => {
+    // 1e999 parses to Infinity, which new Date().toISOString() rejects.
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    fs.writeFileSync(STATE_PATH, `{
+      "active_account_id": null,
+      "accounts": [{
+        "id": "a",
+        "label": "a@example.com",
+        "email": null,
+        "access_token": "access-a",
+        "refresh_token": "refresh-a",
+        "expires_at": 1e999,
+        "limited_until": 1e999,
+        "limited_reason": null,
+        "last_limit_at": null,
+        "created_at": 1
+      }]
+    }`, { mode: 0o600 });
+
+    const status = await request(server()).get('/auth/status');
+
+    expect(status.status).toBe(200);
+    expect(status.body.expires_at).toBeNull();
+    expect(status.body.accounts[0].expires_at).toBeNull();
+    expect(status.body.accounts[0].limited_until).toBeNull();
+
+    const disabled = await request(server()).post('/auth/accounts/a/disable');
+
+    expect(disabled.status).toBe(200);
+    expect(disabled.body.accounts[0].expires_at).toBeNull();
+  });
+
+  it('401s /v1/messages with a clear message when every account is disabled', async () => {
+    addAccount('a');
+    addAccount('b');
+    for (const account of OAuthManager.loadState().accounts) {
+      OAuthManager.disableAccount(account.id);
+    }
+    expect(OAuthManager.getStatus().all_disabled).toBe(true);
+
+    const response = await request(server())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(401);
+    expect(response.body.error).toBe('All OAuth accounts are disabled; activate one at /auth/accounts');
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+});
+
 describe('GET /auth/logout', () => {
   it('removes every account and reports logged out', async () => {
     await completeLogin(tokensFor('a'));

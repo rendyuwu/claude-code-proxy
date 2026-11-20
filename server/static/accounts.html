@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OAuth Accounts</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+      max-width: 900px;
+      margin: 60px auto;
+      padding: 20px;
+      background-color: #f5f5f5;
+      color: #2d3748;
+    }
+    .container {
+      background: white;
+      border-radius: 8px;
+      padding: 32px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #2d3748;
+      margin-top: 0;
+      margin-bottom: 12px;
+    }
+    .subtitle {
+      color: #4a5568;
+      line-height: 1.5;
+      margin: 0 0 24px;
+    }
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    a {
+      color: #1890ff;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid #e2e8f0;
+      vertical-align: top;
+    }
+    th {
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      color: #718096;
+    }
+    .email {
+      color: #718096;
+      font-size: 13px;
+      margin-top: 2px;
+    }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 12px;
+      font-weight: 600;
+      margin-right: 4px;
+    }
+    .badge-active { background-color: #e6ffed; color: #1a7f37; }
+    .badge-ready { background-color: #eef2f7; color: #4a5568; }
+    .badge-disabled { background-color: #ffecec; color: #c0392b; }
+    .badge-limited { background-color: #fff7e6; color: #ad6800; }
+    .actions button {
+      margin-right: 6px;
+    }
+    button {
+      font: inherit;
+      background-color: #1890ff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      padding: 8px 14px;
+      cursor: pointer;
+    }
+    button:hover:enabled {
+      background-color: #0066cc;
+    }
+    button.secondary {
+      background-color: #eef2f7;
+      color: #2d3748;
+    }
+    button.secondary:hover:enabled {
+      background-color: #dde5ee;
+    }
+    button.danger {
+      background-color: #fff1f0;
+      color: #c0392b;
+    }
+    button.danger:hover:enabled {
+      background-color: #ffe0dd;
+    }
+    /* Last, so a disabled variant keeps the greyed-out look its own class set. */
+    button:disabled {
+      background-color: #c9d6e4;
+      cursor: not-allowed;
+    }
+    #error {
+      background-color: #fff7e6;
+      border-left: 4px solid #ffa940;
+      color: #ad6800;
+      padding: 12px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>OAuth Accounts</h1>
+    <p class="subtitle">The active account serves requests. Disabled accounts are skipped even after a rate limit resets; activate one to use it again.</p>
+
+    <div class="toolbar">
+      <button type="button" class="secondary" id="refresh">Refresh</button>
+      <a href="/auth/login">Add account</a>
+    </div>
+
+    <p id="error" role="alert" hidden></p>
+    <p id="empty" hidden>No accounts stored. <a href="/auth/login">Add an account</a>.</p>
+
+    <table id="accounts" hidden>
+      <thead>
+        <tr>
+          <th>Account</th>
+          <th>Status</th>
+          <th>Rate limit resets</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <script>
+    const errorEl = document.getElementById('error');
+    const emptyEl = document.getElementById('empty');
+    const tableEl = document.getElementById('accounts');
+    const rowsEl = document.getElementById('rows');
+    const refreshEl = document.getElementById('refresh');
+
+    const resetText = (account) =>
+      account.limited_until ? new Date(account.limited_until).toLocaleString() : '—';
+
+    function errorText(status, body) {
+      if (body && body.error && typeof body.error === 'object' && body.error.message) {
+        return body.error.message;
+      }
+      if (body && typeof body.error === 'string') return body.error;
+      return `Request failed (${status})`;
+    }
+
+    function showError(message) {
+      errorEl.textContent = message;
+      errorEl.hidden = false;
+    }
+
+    function clearError() {
+      errorEl.textContent = '';
+      errorEl.hidden = true;
+    }
+
+    // Buttons that are disabled by their own state stay disabled while a
+    // request is in flight; dataset.locked is how the busy flag tells them
+    // apart from buttons it disabled itself.
+    function setBusy(value) {
+      for (const button of document.querySelectorAll('button')) {
+        button.disabled = value || button.dataset.locked === '1';
+      }
+    }
+
+    async function readJson(response) {
+      try {
+        return await response.json();
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function badge(text, kind) {
+      const span = document.createElement('span');
+      span.className = `badge badge-${kind}`;
+      span.textContent = text;
+      return span;
+    }
+
+    function actionButton(label, kind, onClick) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = kind;
+      button.textContent = label;
+      button.addEventListener('click', onClick);
+      return button;
+    }
+
+    function rowFor(account) {
+      const tr = document.createElement('tr');
+
+      const accountCell = document.createElement('td');
+      const label = document.createElement('strong');
+      label.textContent = account.label;
+      accountCell.appendChild(label);
+      if (account.email && account.email !== account.label) {
+        const email = document.createElement('div');
+        email.className = 'email';
+        email.textContent = account.email;
+        accountCell.appendChild(email);
+      }
+
+      const statusCell = document.createElement('td');
+      if (account.disabled) {
+        statusCell.appendChild(badge('Disabled', 'disabled'));
+      } else if (account.active) {
+        statusCell.appendChild(badge('Active', 'active'));
+      } else {
+        statusCell.appendChild(badge('Ready', 'ready'));
+      }
+      if (account.limited) {
+        statusCell.appendChild(badge('Rate limited', 'limited'));
+      }
+
+      const resetCell = document.createElement('td');
+      resetCell.textContent = resetText(account);
+
+      const actionsCell = document.createElement('td');
+      actionsCell.className = 'actions';
+      if (!account.active) {
+        const activate = actionButton('Activate', 'secondary', () =>
+          mutate(`/auth/accounts/${encodeURIComponent(account.id)}/activate`, 'POST'));
+        if (account.limited) {
+          activate.disabled = true;
+          activate.dataset.locked = '1';
+          activate.title = `Rate limited until ${resetText(account)}`;
+        }
+        actionsCell.appendChild(activate);
+      }
+      if (!account.disabled) {
+        actionsCell.appendChild(actionButton('Disable', 'secondary', () =>
+          mutate(`/auth/accounts/${encodeURIComponent(account.id)}/disable`, 'POST')));
+      }
+      actionsCell.appendChild(actionButton('Delete', 'danger', () => {
+        if (confirm(`Delete ${account.label}? This cannot be undone.`)) {
+          mutate(`/auth/accounts/${encodeURIComponent(account.id)}`, 'DELETE');
+        }
+      }));
+
+      tr.append(accountCell, statusCell, resetCell, actionsCell);
+      return tr;
+    }
+
+    function render(payload) {
+      const accounts = payload && Array.isArray(payload.accounts) ? payload.accounts : [];
+      rowsEl.replaceChildren(...accounts.map(rowFor));
+      tableEl.hidden = accounts.length === 0;
+      emptyEl.hidden = accounts.length > 0;
+    }
+
+    async function load() {
+      clearError();
+      setBusy(true);
+      try {
+        const response = await fetch('/auth/status');
+        const payload = await readJson(response);
+        if (!response.ok) {
+          showError(errorText(response.status, payload));
+          return;
+        }
+        render(payload);
+      } catch (error) {
+        showError(error.message || 'Request failed');
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    async function mutate(path, method) {
+      clearError();
+      setBusy(true);
+      try {
+        const response = await fetch(path, { method });
+        const payload = await readJson(response);
+        if (!response.ok) {
+          showError(errorText(response.status, payload));
+          return;
+        }
+        render(payload);
+      } catch (error) {
+        showError(error.message || 'Request failed');
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    refreshEl.addEventListener('click', load);
+    load();
+  </script>
+</body>
+</html>

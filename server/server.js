@@ -105,11 +105,85 @@ function isLoopback(req) {
   return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
 }
 
+// Destructive /auth/* mutations are reachable from any local page if a browser
+// is pointed at this port, so reject a cross-origin caller. No Origin header
+// means not a browser fetch (curl, scripts), which the key gate already covers.
+function isSameOrigin(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true; // curl/non-browser callers keep working
+  try {
+    return new URL(origin).host.toLowerCase() === String(req.headers.host || '').toLowerCase();
+  } catch (error) {
+    return false;
+  }
+}
+
 function getClientIP(req) {
   return req.headers['x-forwarded-for'] ||
          req.headers['x-real-ip'] ||
          req.connection.remoteAddress ||
          '127.0.0.1';
+}
+
+// The /auth/status body, reused by every mutation response so the page can
+// render the response directly instead of refetching.
+function statusPayload() {
+  const status = OAuthManager.getStatus();
+  const active = status.accounts.find(a => a.active) || null;
+  // A store can hold junk (1e999 parses to Infinity, a huge reset is past the
+  // Date range). toISOString throws there, and a mutation answering after a
+  // successful write must not take the request down with it.
+  const toIso = (ms) =>
+    (ms && Number.isFinite(ms) && Math.abs(ms) <= 8.64e15) ? new Date(ms).toISOString() : null;
+  return {
+    authenticated: status.authenticated,
+    active_account_id: status.active_account_id,
+    expires_at: active ? toIso(active.expires_at) : null,
+    accounts: status.accounts.map(account => ({
+      ...account,
+      expires_at: toIso(account.expires_at),
+      limited_until: toIso(account.limited_until)
+    }))
+  };
+}
+
+// One handler for disable/activate/delete: same decoding, origin check, error
+// bodies and success payload; only the manager call and the log line differ.
+function handleAccountMutation(req, res, rawId, method, doneMessage) {
+  const respond = (statusCode, body) => {
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+
+  let id;
+  try {
+    id = decodeURIComponent(rawId);
+  } catch (error) {
+    respond(404, { error: 'Account not found' });
+    return;
+  }
+
+  if (!isSameOrigin(req)) {
+    respond(403, { error: 'Cross-origin request rejected' });
+    return;
+  }
+
+  let updated;
+  try {
+    updated = OAuthManager[method](id);
+  } catch (error) {
+    Logger.error(`Failed to update OAuth account ${id}:`, error.message);
+    respond(500, { error: 'Failed to update account' });
+    return;
+  }
+
+  if (!updated) {
+    respond(404, { error: 'Account not found' });
+    return;
+  }
+
+  Logger.info(`OAuth account ${doneMessage}: ${id}`);
+  respond(200, statusPayload());
 }
 
 function serveStaticFile(res, filePath, contentType) {
@@ -285,26 +359,36 @@ async function handleRequest(req, res) {
 
   if (pathname === '/auth/status' && req.method === 'GET') {
     try {
-      const status = OAuthManager.getStatus();
-      const active = status.accounts.find(a => a.active) || null;
-      const toIso = (ms) => (ms ? new Date(ms).toISOString() : null);
-
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        authenticated: status.authenticated,
-        active_account_id: status.active_account_id,
-        expires_at: active ? toIso(active.expires_at) : null,
-        accounts: status.accounts.map(account => ({
-          ...account,
-          expires_at: toIso(account.expires_at),
-          limited_until: toIso(account.limited_until)
-        }))
-      }));
+      res.end(JSON.stringify(statusPayload()));
     } catch (error) {
       Logger.error('Auth status error:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Failed to check authentication status' }));
     }
+    return;
+  }
+
+  if (pathname === '/auth/accounts' && req.method === 'GET') {
+    serveStaticFile(res, 'accounts.html', 'text/html');
+    return;
+  }
+
+  const disableMatch = pathname.match(/^\/auth\/accounts\/([^/]+)\/disable$/);
+  if (disableMatch && req.method === 'POST') {
+    handleAccountMutation(req, res, disableMatch[1], 'disableAccount', 'disabled');
+    return;
+  }
+
+  const activateMatch = pathname.match(/^\/auth\/accounts\/([^/]+)\/activate$/);
+  if (activateMatch && req.method === 'POST') {
+    handleAccountMutation(req, res, activateMatch[1], 'activateAccount', 'activated');
+    return;
+  }
+
+  const deleteMatch = pathname.match(/^\/auth\/accounts\/([^/]+)$/);
+  if (deleteMatch && req.method === 'DELETE') {
+    handleAccountMutation(req, res, deleteMatch[1], 'deleteAccount', 'deleted');
     return;
   }
 
@@ -394,6 +478,7 @@ function startServer() {
     // Display authentication status, including the Claude Code fallback
     const credentials = ClaudeRequest.describeCredentialSource();
     const authUrl = `http://localhost:${port}/auth/login`;
+    const accountsUrl = `http://localhost:${port}/auth/accounts`;
     const usable = credentials.source !== 'none' && !credentials.expired;
     // Pointing at /auth/login while it answers 404 would send anyone reading
     // this banner chasing a route that is switched off.
@@ -405,7 +490,12 @@ function startServer() {
     Logger.info('');
     Logger.info('Authentication Status:');
     if (credentials.source === 'proxy') {
-      if (credentials.allLimited) {
+      if (credentials.allDisabled) {
+        Logger.info(`  ✗ All ${credentials.accountCount} proxy OAuth accounts are disabled`);
+        Logger.info(authRoutes
+          ? `  → Activate one at ${accountsUrl}`
+          : '  → Set AUTH_ROUTES_ENABLED=true and restart, then activate one at /auth/accounts');
+      } else if (credentials.allLimited) {
         const until = credentials.earliestResetAt
           ? credentials.earliestResetAt.toLocaleString()
           : 'an unknown time';

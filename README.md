@@ -56,6 +56,7 @@ Visiting `/auth/login` again adds another account rather than replacing the one 
 
 **Manual Authentication:**
 - Visit `http://localhost:42069/auth/login` to authenticate or add an account
+- Manage accounts: `http://localhost:42069/auth/accounts` (activate, disable, or delete one account; a disabled account is skipped even after its limit resets, and `Activate` clears that and makes it the active account)
 - Check status: `http://localhost:42069/auth/status` (lists accounts; never returns tokens)
 - Logout: `http://localhost:42069/auth/logout` (removes every stored account)
 
