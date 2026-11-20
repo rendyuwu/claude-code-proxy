@@ -261,15 +261,10 @@ async function handleRequest(req, res) {
 
       const tokens = await OAuthManager.exchangeCodeForTokens(code, pkceData.code_verifier, state);
 
-      const tokenData = {
-        access_token: tokens.access_token,
-        refresh_token: tokens.refresh_token,
-        expires_at: Date.now() + (tokens.expires_in * 1000)
-      };
-      OAuthManager.saveTokens(tokenData);
+      const account = await OAuthManager.addAccountFromTokenResponse(tokens);
 
       serveStaticFile(res, 'callback.html', 'text/html');
-      Logger.info('OAuth authentication successful');
+      Logger.info(`OAuth authentication successful: ${account.label}`);
     } catch (error) {
       Logger.error('OAuth callback error:', error.message);
       res.writeHead(500, { 'Content-Type': 'text/html' });
@@ -290,13 +285,20 @@ async function handleRequest(req, res) {
 
   if (pathname === '/auth/status' && req.method === 'GET') {
     try {
-      const isAuthenticated = OAuthManager.isAuthenticated();
-      const expiration = OAuthManager.getTokenExpiration();
+      const status = OAuthManager.getStatus();
+      const active = status.accounts.find(a => a.active) || null;
+      const toIso = (ms) => (ms ? new Date(ms).toISOString() : null);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        authenticated: isAuthenticated,
-        expires_at: expiration ? expiration.toISOString() : null
+        authenticated: status.authenticated,
+        active_account_id: status.active_account_id,
+        expires_at: active ? toIso(active.expires_at) : null,
+        accounts: status.accounts.map(account => ({
+          ...account,
+          expires_at: toIso(account.expires_at),
+          limited_until: toIso(account.limited_until)
+        }))
       }));
     } catch (error) {
       Logger.error('Auth status error:', error.message);
@@ -362,7 +364,11 @@ async function handleRequest(req, res) {
       await new ClaudeRequest(req).handleResponse(res, body, presetName);
     } catch (error) {
       Logger.error('Request error:', error.message);
-      res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
+      const headers = { 'Content-Type': 'application/json' };
+      if (error.retryAfterSeconds) {
+        headers['Retry-After'] = String(error.retryAfterSeconds);
+      }
+      res.writeHead(error.statusCode || 500, headers);
       res.end(JSON.stringify({ error: error.message }));
     }
     return;
@@ -399,7 +405,16 @@ function startServer() {
     Logger.info('');
     Logger.info('Authentication Status:');
     if (credentials.source === 'proxy') {
-      Logger.info(`  ✓ Authenticated with proxy OAuth tokens until ${credentials.expiresAt.toLocaleString()}`);
+      if (credentials.allLimited) {
+        const until = credentials.earliestResetAt
+          ? credentials.earliestResetAt.toLocaleString()
+          : 'an unknown time';
+        Logger.info(`  ✗ All ${credentials.accountCount} proxy OAuth accounts are rate limited until ${until}`);
+      } else {
+        const plural = credentials.accountCount === 1 ? 'account' : 'accounts';
+        const until = credentials.expiresAt ? ` until ${credentials.expiresAt.toLocaleString()}` : '';
+        Logger.info(`  ✓ Authenticated with proxy OAuth (${credentials.accountCount} ${plural}); active: ${credentials.activeLabel}${until}`);
+      }
     } else if (credentials.source === 'claude-code' && !credentials.expired) {
       const until = credentials.expiresAt ? ` until ${credentials.expiresAt.toLocaleString()}` : '';
       Logger.info(`  ✓ Using Claude Code credentials (read-only)${until}`);

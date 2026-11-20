@@ -16,13 +16,32 @@ jest.mock('./Logger', () => ({
 
 jest.mock('./OAuthManager', () => ({
   isAuthenticated: jest.fn().mockReturnValue(true),
+  getActiveAccount: jest.fn(() => ({ id: 'acct-1', label: 'Account 1' })),
   getValidAccessToken: jest.fn().mockResolvedValue('stored-access-token'),
   refreshAccessToken: jest.fn().mockResolvedValue({ access_token: 'refreshed-access-token' }),
-  getTokenExpiration: jest.fn().mockReturnValue(new Date(Date.now() + 3600000)),
+  accountCount: jest.fn().mockReturnValue(1),
+  markAccountLimited: jest.fn().mockReturnValue(null),
+  getEarliestResetMs: jest.fn().mockReturnValue(null),
+  getStatus: jest.fn(() => ({
+    authenticated: true,
+    active_account_id: 'acct-1',
+    all_limited: false,
+    earliest_reset_at: null,
+    accounts: [{
+      id: 'acct-1',
+      label: 'Account 1',
+      email: null,
+      expires_at: Date.now() + 3600000,
+      limited_until: null,
+      limited: false,
+      limited_reason: null,
+      active: true
+    }]
+  })),
   generatePKCE: jest.fn(),
   buildAuthorizationURL: jest.fn(),
   exchangeCodeForTokens: jest.fn(),
-  saveTokens: jest.fn(),
+  addAccountFromTokenResponse: jest.fn().mockResolvedValue({ id: 'acct-1', label: 'Account 1' }),
   logout: jest.fn()
 }));
 

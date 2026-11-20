@@ -16,12 +16,35 @@ jest.mock('./Logger', () => ({
   createDebugStream: jest.fn()
 }));
 
-jest.mock('./OAuthManager', () => ({
-  isAuthenticated: jest.fn().mockReturnValue(true),
-  getValidAccessToken: jest.fn().mockResolvedValue('stored-access-token'),
-  refreshAccessToken: jest.fn().mockResolvedValue({ access_token: 'refreshed-access-token' }),
-  getTokenExpiration: jest.fn().mockReturnValue(new Date(Date.now() + 3600000))
-}));
+jest.mock('./OAuthManager', () => {
+  const account = () => ({
+    id: 'acct-1',
+    label: 'Account 1',
+    email: null,
+    expires_at: Date.now() + 3600000,
+    limited_until: null,
+    limited: false,
+    limited_reason: null,
+    active: true
+  });
+
+  return {
+    isAuthenticated: jest.fn().mockReturnValue(true),
+    getActiveAccount: jest.fn(() => ({ id: 'acct-1', label: 'Account 1' })),
+    getValidAccessToken: jest.fn().mockResolvedValue('stored-access-token'),
+    refreshAccessToken: jest.fn().mockResolvedValue({ access_token: 'refreshed-access-token' }),
+    accountCount: jest.fn().mockReturnValue(1),
+    markAccountLimited: jest.fn().mockReturnValue(null),
+    getEarliestResetMs: jest.fn().mockReturnValue(null),
+    getStatus: jest.fn(() => ({
+      authenticated: true,
+      active_account_id: 'acct-1',
+      all_limited: false,
+      earliest_reset_at: null,
+      accounts: [account()]
+    }))
+  };
+});
 
 const OAuthManager = require('./OAuthManager');
 const ClaudeRequest = require('./ClaudeRequest');
@@ -58,9 +81,12 @@ beforeEach(() => {
   nock.cleanAll();
   jest.clearAllMocks();
   OAuthManager.isAuthenticated.mockReturnValue(true);
+  OAuthManager.getActiveAccount.mockReturnValue({ id: 'acct-1', label: 'Account 1' });
   OAuthManager.getValidAccessToken.mockResolvedValue('stored-access-token');
   OAuthManager.refreshAccessToken.mockResolvedValue({ access_token: 'refreshed-access-token' });
-  OAuthManager.getTokenExpiration.mockReturnValue(new Date(Date.now() + 3600000));
+  OAuthManager.accountCount.mockReturnValue(1);
+  OAuthManager.markAccountLimited.mockReturnValue(null);
+  OAuthManager.getEarliestResetMs.mockReturnValue(null);
 });
 
 afterEach(() => {
@@ -451,6 +477,183 @@ describe('response forwarding', () => {
 
     expect(response.status).toBe(401);
     expect(response.body.error).toMatch(/credentials/i);
+  });
+});
+
+describe('429 failover', () => {
+  const rateLimited = (authorizations, resetSec) => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        authorizations.push(this.req.headers.authorization);
+        return [
+          429,
+          JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } }),
+          {
+            'content-type': 'application/json',
+            'anthropic-ratelimit-unified-status': 'rejected',
+            'anthropic-ratelimit-unified-reset': String(resetSec)
+          }
+        ];
+      });
+  };
+
+  const ok = (authorizations) => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        authorizations.push(this.req.headers.authorization);
+        return [200, JSON.stringify({ id: 'msg_2' }), { 'content-type': 'application/json' }];
+      });
+  };
+
+  it('retries the same request on the next account with its own token', async () => {
+    const authorizations = [];
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+
+    OAuthManager.getActiveAccount
+      .mockReturnValueOnce({ id: 'a1', label: 'Account A' })
+      .mockReturnValueOnce({ id: 'a2', label: 'Account B' });
+    OAuthManager.getValidAccessToken.mockImplementation(id => Promise.resolve(`token-${id}`));
+    OAuthManager.accountCount.mockReturnValue(2);
+    OAuthManager.markAccountLimited.mockReturnValue({ id: 'a2', label: 'Account B' });
+
+    rateLimited(authorizations, resetSec);
+    ok(authorizations);
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe('msg_2');
+    expect(authorizations).toEqual(['Bearer token-a1', 'Bearer token-a2']);
+    expect(OAuthManager.markAccountLimited).toHaveBeenCalledTimes(1);
+    expect(OAuthManager.markAccountLimited).toHaveBeenCalledWith('a1', {
+      resetAtMs: resetSec * 1000,
+      reason: 'rate_limit'
+    });
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('never fails over for a client-supplied x-api-key', async () => {
+    const scope = nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(429, { type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .set('x-api-key', 'sk-ant-oat01-client')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(429);
+    expect(response.body.error.type).toBe('rate_limit_error');
+    expect(OAuthManager.markAccountLimited).not.toHaveBeenCalled();
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it('forwards the upstream 429 body once every account is limited', async () => {
+    OAuthManager.accountCount.mockReturnValue(1);
+    OAuthManager.markAccountLimited.mockReturnValue(null);
+
+    const scope = nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(429, { type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } });
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(429);
+    expect(response.body).toEqual({ type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } });
+    expect(OAuthManager.markAccountLimited).toHaveBeenCalledTimes(1);
+    expect(scope.isDone()).toBe(true);
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('answers 429 with Retry-After without calling upstream when all accounts are limited', async () => {
+    OAuthManager.getActiveAccount.mockReturnValue(null);
+    OAuthManager.accountCount.mockReturnValue(2);
+    OAuthManager.getEarliestResetMs.mockReturnValue(Date.now() + 60000);
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(429);
+    expect(response.body.error).toMatch(/All 2 OAuth accounts are rate limited/);
+    expect(Number(response.headers['retry-after'])).toBeGreaterThanOrEqual(59);
+    expect(Number(response.headers['retry-after'])).toBeLessThanOrEqual(60);
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('stops at the last account and forwards that account 429', async () => {
+    const authorizations = [];
+
+    OAuthManager.getActiveAccount
+      .mockReturnValueOnce({ id: 'a1', label: 'Account A' })
+      .mockReturnValueOnce({ id: 'a2', label: 'Account B' });
+    OAuthManager.getValidAccessToken.mockImplementation(id => Promise.resolve(`token-${id}`));
+    OAuthManager.accountCount.mockReturnValue(2);
+    OAuthManager.markAccountLimited
+      .mockReturnValueOnce({ id: 'a2', label: 'Account B' })
+      .mockReturnValueOnce(null);
+
+    const limitedReply = (message) => nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        authorizations.push(this.req.headers.authorization);
+        return [
+          429,
+          JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }),
+          { 'content-type': 'application/json' }
+        ];
+      });
+
+    limitedReply('usage limit A');
+    limitedReply('usage limit B');
+
+    const response = await request(messagesServer())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(429);
+    expect(response.body.error.message).toBe('usage limit B');
+    expect(authorizations).toEqual(['Bearer token-a1', 'Bearer token-a2']);
+    expect(OAuthManager.markAccountLimited).toHaveBeenCalledTimes(2);
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('does not build a date from an unusable reset value', () => {
+    const error = new ClaudeRequest().rateLimitError(2, 1e17);
+
+    expect(error.statusCode).toBe(429);
+    expect(error.retryAfterSeconds).toBeUndefined();
+    expect(error.message).toBe('All 2 OAuth accounts are rate limited');
+  });
+
+  it('parses the reset headers', () => {
+    expect(ClaudeRequest.limitResetAtMs({ 'anthropic-ratelimit-unified-reset': '1790000000' }))
+      .toBe(1790000000000);
+    expect(ClaudeRequest.limitResetAtMs({ 'anthropic-ratelimit-unified-reset': '1790000000000' }))
+      .toBe(1790000000000);
+
+    const before = Date.now();
+    const fromSeconds = ClaudeRequest.limitResetAtMs({ 'retry-after': '30' });
+    expect(fromSeconds).toBeGreaterThanOrEqual(before + 30000);
+    expect(fromSeconds).toBeLessThanOrEqual(before + 31000);
+
+    const httpDate = 'Wed, 21 Oct 2026 07:28:00 GMT';
+    expect(ClaudeRequest.limitResetAtMs({ 'retry-after': httpDate })).toBe(Date.parse(httpDate));
+
+    expect(ClaudeRequest.limitResetAtMs({})).toBeNull();
+    expect(ClaudeRequest.limitResetAtMs(null)).toBeNull();
+    expect(ClaudeRequest.limitResetAtMs({ 'retry-after': 'garbage' })).toBeNull();
   });
 });
 

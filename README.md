@@ -49,13 +49,15 @@ The proxy now supports **standalone OAuth authentication** - no Claude Code inst
 
 1. If not authenticated, your browser will automatically open to `/auth/login`
 2. You'll be redirected to claude.ai to authorize the application
-3. After approval, tokens are saved to `~/.claude-code-proxy/tokens.json`
+3. After approval, the account is saved to `~/.claude-code-proxy/accounts.json`
 4. Tokens refresh automatically when they expire
 
+Visiting `/auth/login` again adds another account rather than replacing the one in use. Requests always go to one active account, so the prompt-cache prefix stays stable; when that account answers 429 the proxy marks it limited until its reset and retries the same request on the next account in login order. A limit that expires does not pull traffic back: only a 429 moves the active account. If every account is limited the proxy answers 429 with `Retry-After`.
+
 **Manual Authentication:**
-- Visit `http://localhost:42069/auth/login` to authenticate
-- Check status: `http://localhost:42069/auth/status`
-- Logout: `http://localhost:42069/auth/logout`
+- Visit `http://localhost:42069/auth/login` to authenticate or add an account
+- Check status: `http://localhost:42069/auth/status` (lists accounts; never returns tokens)
+- Logout: `http://localhost:42069/auth/logout` (removes every stored account)
 
 **Configuration Options** (in `server/config.txt`):
 ```
@@ -67,7 +69,7 @@ upstream_timeout_ms=300000       # Abort a request to api.anthropic.com after th
 
 **Token Priority** (upstream credential, unrelated to `proxy_api_key` above; step 1 is disabled while the client gate is on):
 1. `x-api-key` header (if provided in requests) - used for that request only, never cached for other clients. If Anthropic rejects it, you get the 401 back instead of the proxy quietly falling back to its own credentials
-2. OAuth tokens from `~/.claude-code-proxy/tokens.json` - refreshed automatically
+2. OAuth accounts from `~/.claude-code-proxy/accounts.json` - the active one is used and refreshed automatically
 3. Claude Code credentials from `~/.claude/.credentials.json` (if fallback enabled) - read-only, never refreshed by the proxy
 
 ### Locking Down the Proxy (Client Authentication)
@@ -110,7 +112,7 @@ AUTH_ROUTES_ENABLED=false   # or in .env / the environment, which wins
 
 Every `/auth/*` path then answers `404` — from localhost too, and whether or not a key is set, so the routes look like they were never there rather than like something a key would open. `/v1/*` and `/health` are untouched.
 
-Do this only after the proxy has credentials: either its own `~/.claude-code-proxy/tokens.json`, or a mounted `~/.claude` it reads Claude Code's from. To log in again, set it back to `true` and restart. The startup banner says `/auth/* is disabled` while it is off, so a 404 there is never a mystery.
+Do this only after the proxy has credentials: either its own `~/.claude-code-proxy/accounts.json`, or a mounted `~/.claude` it reads Claude Code's from. To log in again, set it back to `true` and restart. The startup banner says `/auth/* is disabled` while it is off, so a 404 there is never a mystery.
 
 ### Claude Code Credentials (Legacy Fallback)
 
@@ -194,7 +196,7 @@ Most likely thing to go wrong is not being able to find the credentials, either 
 
 ### Authentication
 - **OAuth Flow**: Implements PKCE OAuth 2.0 flow to authenticate directly with claude.ai
-- **Token Management**: Automatically refreshes its own OAuth tokens (`~/.claude-code-proxy/tokens.json`) when they expire
+- **Token Management**: Keeps a pool of OAuth accounts in `~/.claude-code-proxy/accounts.json`, refreshes their tokens when they expire, and fails a rate-limited request over to the next account
 - **Fallback Support**: Can optionally read Claude Code credentials as a fallback, without ever writing to that file
 
 ### Request Processing

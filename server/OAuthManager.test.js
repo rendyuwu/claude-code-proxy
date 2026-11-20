@@ -12,28 +12,50 @@ jest.mock('./Logger', () => ({
   warn: jest.fn()
 }));
 
+const TEST_DIR = path.join(__dirname, '.test-accounts');
+const STATE_PATH = path.join(TEST_DIR, 'accounts.json');
+const TOKEN_PATH = path.join(TEST_DIR, 'tokens.json');
+
+const tokensFor = (suffix, expiresAt = Date.now() + 3600000) => ({
+  access_token: `token-${suffix}`,
+  refresh_token: `refresh-${suffix}`,
+  expires_at: expiresAt
+});
+
+const identityFor = (suffix) => ({
+  account_uuid: `uuid-${suffix}`,
+  organization_uuid: `org-${suffix}`,
+  email: `${suffix}@example.com`
+});
+
+const addAccount = (suffix, identity = identityFor(suffix)) =>
+  OAuthManager.addAccount(tokensFor(suffix), identity);
+
+const readState = () => JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+
 describe('OAuthManager', () => {
-  let testTokenPath;
+  beforeAll(() => {
+    // An unexpected refresh must fail fast instead of reaching the network.
+    nock.disableNetConnect();
+  });
+
+  afterAll(() => {
+    nock.enableNetConnect();
+  });
 
   beforeEach(() => {
-    // Use a temporary directory for testing
-    testTokenPath = path.join(__dirname, '.test-tokens', 'tokens.json');
-    OAuthManager.tokenPath = testTokenPath;
-    OAuthManager.cachedToken = null;
-    OAuthManager.refreshPromise = null;
+    OAuthManager.statePath = STATE_PATH;
+    OAuthManager.tokenPath = TOKEN_PATH;
+    OAuthManager.refreshPromises.clear();
 
-    // Clean up test directory
-    const testDir = path.dirname(testTokenPath);
-    if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+    if (fs.existsSync(TEST_DIR)) {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true });
     }
   });
 
   afterEach(() => {
-    // Clean up
-    const testDir = path.dirname(testTokenPath);
-    if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
+    if (fs.existsSync(TEST_DIR)) {
+      fs.rmSync(TEST_DIR, { recursive: true, force: true });
     }
     nock.cleanAll();
   });
@@ -96,140 +118,460 @@ describe('OAuthManager', () => {
     });
   });
 
-  describe('saveTokens and loadTokens', () => {
-    it('should save and load tokens successfully', () => {
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000
-      };
+  describe('account store', () => {
+    it('writes mode 0600 and makes the first account active', () => {
+      const account = addAccount('a');
 
-      OAuthManager.saveTokens(tokens);
+      expect(account.active).toBe(true);
+      expect(fs.existsSync(STATE_PATH)).toBe(true);
 
-      const loaded = OAuthManager.loadTokens();
-      expect(loaded).toEqual(tokens);
-    });
-
-    it('should create directory if it does not exist', () => {
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000
-      };
-
-      const testDir = path.dirname(testTokenPath);
-      expect(fs.existsSync(testDir)).toBe(false);
-
-      OAuthManager.saveTokens(tokens);
-
-      expect(fs.existsSync(testDir)).toBe(true);
-      expect(fs.existsSync(testTokenPath)).toBe(true);
-    });
-
-    it('should set file permissions to 600 on Unix', () => {
-      if (process.platform === 'win32') {
-        return; // Skip this test on Windows
+      if (process.platform !== 'win32') {
+        expect(fs.statSync(STATE_PATH).mode & 0o777).toBe(0o600);
       }
 
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
+      const state = readState();
+      expect(state.active_account_id).toBe(account.id);
+      expect(state.accounts).toHaveLength(1);
+      expect(state.accounts[0].label).toBe('a@example.com');
+      expect(state.accounts[0].account_uuid).toBe('uuid-a');
+      expect(state.accounts[0].organization_uuid).toBe('org-a');
+    });
+
+    it('appends a second identity without changing the active account', () => {
+      const first = addAccount('a');
+      const second = addAccount('b');
+
+      expect(second.active).toBe(false);
+      expect(second.id).not.toBe(first.id);
+      expect(OAuthManager.accountCount()).toBe(2);
+      expect(readState().active_account_id).toBe(first.id);
+      expect(OAuthManager.getActiveAccount().id).toBe(first.id);
+    });
+
+    it('replaces the same identity in place and clears its limit', () => {
+      const first = addAccount('a');
+
+      const state = readState();
+      state.accounts[0].limited_until = Date.now() + 600000;
+      state.accounts[0].limited_reason = 'rate_limit';
+      state.accounts[0].last_limit_at = Date.now();
+      OAuthManager.saveState(state);
+
+      const replaced = OAuthManager.addAccount(tokensFor('a-new'), identityFor('a'));
+
+      expect(replaced.id).toBe(first.id);
+      expect(replaced.limited).toBe(false);
+      expect(OAuthManager.accountCount()).toBe(1);
+
+      const stored = readState().accounts[0];
+      expect(stored.access_token).toBe('token-a-new');
+      expect(stored.refresh_token).toBe('refresh-a-new');
+      expect(stored.limited_until).toBeNull();
+      expect(stored.limited_reason).toBeNull();
+      expect(stored.last_limit_at).toBeNull();
+    });
+
+    it('adopts a migrated account that has no UUIDs but the same email', () => {
+      OAuthManager.saveState({
+        active_account_id: 'legacy-id',
+        accounts: [{
+          id: 'legacy-id',
+          label: 'Account 1',
+          email: 'm@example.com',
+          account_uuid: null,
+          organization_uuid: null,
+          access_token: 'legacy-token',
+          refresh_token: 'legacy-refresh',
+          expires_at: Date.now() + 3600000,
+          limited_until: null,
+          limited_reason: null,
+          last_limit_at: null,
+          created_at: Date.now()
+        }]
+      });
+
+      const adopted = OAuthManager.addAccount(
+        tokensFor('m'),
+        { account_uuid: 'uuid-m', organization_uuid: 'org-m', email: 'm@example.com' }
+      );
+
+      expect(adopted.id).toBe('legacy-id');
+      expect(OAuthManager.accountCount()).toBe(1);
+
+      const stored = readState().accounts[0];
+      expect(stored.account_uuid).toBe('uuid-m');
+      expect(stored.organization_uuid).toBe('org-m');
+      expect(stored.access_token).toBe('token-m');
+    });
+
+    it('adopts the sole migrated account on the next login', () => {
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      fs.writeFileSync(TOKEN_PATH, JSON.stringify({
+        access_token: 'legacy-access',
+        refresh_token: 'legacy-refresh',
         expires_at: Date.now() + 3600000
-      };
+      }));
+      const migrated = OAuthManager.loadState().accounts[0];
+      expect(migrated.account_uuid).toBeNull();
 
-      OAuthManager.saveTokens(tokens);
+      const adopted = OAuthManager.addAccount(tokensFor('me'), identityFor('me'));
 
-      const stats = fs.statSync(testTokenPath);
-      const mode = stats.mode & 0o777;
-      expect(mode).toBe(0o600);
+      expect(adopted.id).toBe(migrated.id);
+      expect(OAuthManager.accountCount()).toBe(1);
+
+      const stored = readState().accounts[0];
+      expect(stored.access_token).toBe('token-me');
+      expect(stored.refresh_token).toBe('refresh-me');
+      expect(stored.account_uuid).toBe('uuid-me');
+      expect(stored.label).toBe('me@example.com');
     });
 
-    it('should return null if token file does not exist', () => {
-      const loaded = OAuthManager.loadTokens();
-      expect(loaded).toBeNull();
+    it('keeps the stored refresh token when a login omits it', () => {
+      addAccount('a');
+
+      OAuthManager.addAccount(
+        { access_token: 'token-a-2', expires_at: Date.now() + 3600000 },
+        identityFor('a')
+      );
+
+      const stored = readState().accounts[0];
+      expect(stored.access_token).toBe('token-a-2');
+      expect(stored.refresh_token).toBe('refresh-a');
     });
 
-    it('should return null if token file is invalid JSON', () => {
-      const testDir = path.dirname(testTokenPath);
-      fs.mkdirSync(testDir, { recursive: true });
-      fs.writeFileSync(testTokenPath, 'invalid json');
+    it('migrates a legacy tokens.json once and deletes it', () => {
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      fs.writeFileSync(TOKEN_PATH, JSON.stringify({
+        access_token: 'legacy-access',
+        refresh_token: 'legacy-refresh',
+        expires_at: 1790000000000
+      }));
 
-      const loaded = OAuthManager.loadTokens();
-      expect(loaded).toBeNull();
+      const state = OAuthManager.loadState();
+
+      expect(state.accounts).toHaveLength(1);
+      expect(state.active_account_id).toBe(state.accounts[0].id);
+      expect(state.accounts[0]).toMatchObject({
+        label: 'Account 1',
+        email: null,
+        account_uuid: null,
+        organization_uuid: null,
+        access_token: 'legacy-access',
+        refresh_token: 'legacy-refresh',
+        expires_at: 1790000000000
+      });
+      expect(fs.existsSync(STATE_PATH)).toBe(true);
+      expect(fs.existsSync(TOKEN_PATH)).toBe(false);
+    });
+
+    it('returns an empty store for an unparseable accounts.json', () => {
+      fs.mkdirSync(TEST_DIR, { recursive: true });
+      fs.writeFileSync(STATE_PATH, 'not json');
+
+      expect(OAuthManager.loadState()).toEqual({ active_account_id: null, accounts: [] });
+      expect(OAuthManager.isAuthenticated()).toBe(false);
+    });
+  });
+
+  describe('sticky active account', () => {
+    it('moves only on a 429 and never moves back when a limit expires', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      const c = addAccount('c');
+
+      expect(OAuthManager.getActiveAccount().id).toBe(a.id);
+
+      // A limits: failover walks forward to B.
+      expect(OAuthManager.markAccountLimited(a.id).id).toBe(b.id);
+      expect(readState().active_account_id).toBe(b.id);
+
+      // A's limit resets. B is healthy, so traffic stays on B.
+      const state = readState();
+      state.accounts[0].limited_until = Date.now() - 1000;
+      OAuthManager.saveState(state);
+
+      expect(OAuthManager.getActiveAccount().id).toBe(b.id);
+      expect(OAuthManager.getStatus().accounts[0].limited).toBe(false);
+
+      expect(OAuthManager.markAccountLimited(b.id).id).toBe(c.id);
+      // C limits: A is re-eligible again because its limit expired.
+      expect(OAuthManager.markAccountLimited(c.id).id).toBe(a.id);
+    });
+
+    it('reports all limited, the earliest reset, and no usable account', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+
+      const resetA = Date.now() + 60000;
+      const resetB = Date.now() + 120000;
+
+      expect(OAuthManager.markAccountLimited(a.id, { resetAtMs: resetA }).id).toBe(b.id);
+      expect(OAuthManager.markAccountLimited(b.id, { resetAtMs: resetB })).toBeNull();
+
+      expect(OAuthManager.getActiveAccount()).toBeNull();
+      expect(OAuthManager.getStatus().all_limited).toBe(true);
+      expect(OAuthManager.getEarliestResetMs()).toBe(resetA);
+    });
+
+    it('does not move the pointer past the current account for a stale 429', () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+      addAccount('c');
+
+      OAuthManager.markAccountLimited(a.id);
+      expect(readState().active_account_id).toBe(b.id);
+
+      // A second 429 for the already-superseded account A must keep B active.
+      expect(OAuthManager.markAccountLimited(a.id).id).toBe(b.id);
+      expect(readState().active_account_id).toBe(b.id);
+    });
+  });
+
+  describe('markAccountLimited', () => {
+    it('uses an explicit future reset time', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      const resetAt = Date.now() + 900000;
+
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: resetAt });
+
+      expect(readState().accounts[0].limited_until).toBe(resetAt);
+      expect(readState().accounts[0].limited_reason).toBe('rate_limit');
+    });
+
+    it('falls back to a five minute cooldown without a reset header', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      const before = Date.now();
+
+      OAuthManager.markAccountLimited(a.id);
+
+      const limitedUntil = readState().accounts[0].limited_until;
+      expect(limitedUntil).toBeGreaterThanOrEqual(before + 300000);
+      expect(limitedUntil).toBeLessThanOrEqual(before + 301000);
+    });
+
+    it('ignores a reset time that is already in the past', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      const before = Date.now();
+
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: before - 60000 });
+
+      expect(readState().accounts[0].limited_until).toBeGreaterThanOrEqual(before + 300000);
+    });
+
+    it('caps a reset header at one week', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      const before = Date.now();
+      const weekMs = 7 * 24 * 60 * 60 * 1000;
+
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: before + 30 * 24 * 60 * 60 * 1000 });
+
+      const limitedUntil = readState().accounts[0].limited_until;
+      expect(limitedUntil).toBeGreaterThanOrEqual(before + weekMs);
+      expect(limitedUntil).toBeLessThanOrEqual(before + weekMs + 1000);
+    });
+
+    it('returns null when the only account is limited', () => {
+      const a = addAccount('a');
+
+      expect(OAuthManager.markAccountLimited(a.id)).toBeNull();
+      expect(OAuthManager.accountCount()).toBe(1);
+    });
+  });
+
+  describe('getStatus', () => {
+    it('exposes sanitized accounts only', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: Date.now() + 60000 });
+
+      const status = OAuthManager.getStatus();
+      const serialized = JSON.stringify(status.accounts);
+
+      expect(serialized).not.toContain('access_token');
+      expect(serialized).not.toContain('refresh_token');
+      expect(serialized).not.toContain('token-a');
+      expect(status.accounts).toHaveLength(2);
+      expect(status.accounts[1]).toMatchObject({
+        id: expect.any(String),
+        label: 'b@example.com',
+        email: 'b@example.com',
+        active: true,
+        limited: false,
+        limited_until: null
+      });
+      expect(status.authenticated).toBe(true);
+      expect(status.active_account_id).toBe(status.accounts[1].id);
+    });
+  });
+
+  describe('refresh', () => {
+    it('refreshes only the requested account', async () => {
+      const a = addAccount('a', identityFor('a'));
+      addAccount('b', identityFor('b'));
+
+      // Make A expired and B still valid.
+      const state = readState();
+      state.accounts[0].expires_at = Date.now() - 1000;
+      OAuthManager.saveState(state);
+
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token', (body) => body.refresh_token === 'refresh-a')
+        .reply(200, { access_token: 'new-a', refresh_token: 'rotated-a', expires_in: 3600 });
+
+      await expect(OAuthManager.getValidAccessToken(a.id)).resolves.toBe('new-a');
+
+      const stored = readState().accounts;
+      expect(stored[0].access_token).toBe('new-a');
+      expect(stored[0].refresh_token).toBe('rotated-a');
+      expect(stored[1].access_token).toBe('token-b');
+      expect(stored[1].refresh_token).toBe('refresh-b');
+    });
+
+    it('makes one request for concurrent refreshes of the same account', async () => {
+      const a = addAccount('a');
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token')
+        .once()
+        .reply(200, { access_token: 'new-a', refresh_token: 'rotated-a', expires_in: 3600 });
+
+      const [first, second] = await Promise.all([
+        OAuthManager.refreshAccessToken(a.id),
+        OAuthManager.refreshAccessToken(a.id)
+      ]);
+
+      expect(first.access_token).toBe('new-a');
+      expect(second.access_token).toBe('new-a');
+      expect(nock.pendingMocks()).toEqual([]);
+    });
+
+    it('recovers after a failed refresh once the credential is repaired', async () => {
+      const a = addAccount('a');
+      let state = readState();
+      state.accounts[0].refresh_token = null;
+      OAuthManager.saveState(state);
+
+      await expect(OAuthManager.refreshAccessToken(a.id)).rejects.toThrow('No refresh token available');
+      // The failure must not stay cached as the account's in-flight refresh.
+      expect(OAuthManager.refreshPromises.size).toBe(0);
+
+      state = readState();
+      state.accounts[0].refresh_token = 'refresh-repaired';
+      OAuthManager.saveState(state);
+
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token', (body) => body.refresh_token === 'refresh-repaired')
+        .reply(200, { access_token: 'new-a', expires_in: 3600 });
+
+      await expect(OAuthManager.refreshAccessToken(a.id))
+        .resolves.toMatchObject({ access_token: 'new-a' });
+      expect(readState().accounts[0].access_token).toBe('new-a');
+    });
+
+    it('refreshes different accounts in parallel', async () => {
+      const a = addAccount('a');
+      const b = addAccount('b');
+
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token', (body) => body.refresh_token === 'refresh-a')
+        .reply(200, { access_token: 'new-a', expires_in: 3600 });
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token', (body) => body.refresh_token === 'refresh-b')
+        .reply(200, { access_token: 'new-b', expires_in: 3600 });
+
+      const [first, second] = await Promise.all([
+        OAuthManager.refreshAccessToken(a.id),
+        OAuthManager.refreshAccessToken(b.id)
+      ]);
+
+      expect(first.access_token).toBe('new-a');
+      expect(second.access_token).toBe('new-b');
+      expect(nock.pendingMocks()).toEqual([]);
+    });
+
+    it('does not refresh a token that is valid for more than a minute', async () => {
+      const a = addAccount('a');
+
+      await expect(OAuthManager.getValidAccessToken(a.id)).resolves.toBe('token-a');
+      expect(nock.pendingMocks()).toEqual([]);
+    });
+
+    it('treats a missing expires_at as expired', async () => {
+      const a = addAccount('a');
+      const state = readState();
+      delete state.accounts[0].expires_at;
+      OAuthManager.saveState(state);
+
+      nock('https://console.anthropic.com')
+        .post('/v1/oauth/token')
+        .reply(200, { access_token: 'new-a', expires_in: 3600 });
+
+      await expect(OAuthManager.getValidAccessToken(a.id)).resolves.toBe('new-a');
+    });
+
+    it('throws for an unknown account', async () => {
+      addAccount('a');
+
+      await expect(OAuthManager.getValidAccessToken('nope')).rejects.toThrow('Account not found: nope');
+      await expect(OAuthManager.refreshAccessToken('nope')).rejects.toThrow('Account not found: nope');
+    });
+
+    it('throws when the account has no refresh token', async () => {
+      const a = addAccount('a');
+      const state = readState();
+      state.accounts[0].refresh_token = null;
+      OAuthManager.saveState(state);
+
+      await expect(OAuthManager.refreshAccessToken(a.id)).rejects.toThrow('No refresh token available');
     });
   });
 
   describe('isAuthenticated', () => {
-    it('should return false when no tokens exist', () => {
+    it('is false with no accounts', () => {
       expect(OAuthManager.isAuthenticated()).toBe(false);
     });
 
-    it('should return true when valid tokens exist', () => {
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000
-      };
-
-      OAuthManager.saveTokens(tokens);
+    it('is true with an account, expired or not', () => {
+      const a = addAccount('a');
       expect(OAuthManager.isAuthenticated()).toBe(true);
-    });
 
-    it('should return true even if tokens are expired', () => {
-      // isAuthenticated only checks if tokens exist, not if they're expired
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() - 1000
-      };
-
-      OAuthManager.saveTokens(tokens);
+      const state = readState();
+      state.accounts[0].expires_at = Date.now() - 1000;
+      OAuthManager.saveState(state);
       expect(OAuthManager.isAuthenticated()).toBe(true);
-    });
-  });
-
-  describe('getTokenExpiration', () => {
-    it('should return null when no tokens exist', () => {
-      expect(OAuthManager.getTokenExpiration()).toBeNull();
+      expect(a.id).toBeTruthy();
     });
 
-    it('should return expiration date when tokens exist', () => {
-      const expiresAt = Date.now() + 3600000;
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: expiresAt
-      };
+    it('is false when the store holds only tokens without a refresh token', () => {
+      OAuthManager.saveState({
+        active_account_id: 'x',
+        accounts: [{ id: 'x', access_token: 'only-access', refresh_token: null }]
+      });
 
-      OAuthManager.saveTokens(tokens);
-
-      const expiration = OAuthManager.getTokenExpiration();
-      expect(expiration).toBeInstanceOf(Date);
-      expect(expiration.getTime()).toBe(expiresAt);
+      expect(OAuthManager.isAuthenticated()).toBe(false);
     });
   });
 
   describe('logout', () => {
-    it('should delete token file and clear cached token', () => {
-      const tokens = {
-        access_token: 'test-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000
-      };
+    it('removes both files and clears in-flight refreshes', () => {
+      addAccount('a');
+      fs.writeFileSync(TOKEN_PATH, JSON.stringify({ access_token: 'legacy', refresh_token: 'legacy' }));
+      OAuthManager.refreshPromises.set('a', Promise.resolve());
 
-      OAuthManager.saveTokens(tokens);
-      OAuthManager.cachedToken = 'cached-token';
-
-      expect(fs.existsSync(testTokenPath)).toBe(true);
-      expect(OAuthManager.cachedToken).toBe('cached-token');
+      expect(fs.existsSync(STATE_PATH)).toBe(true);
+      expect(fs.existsSync(TOKEN_PATH)).toBe(true);
 
       OAuthManager.logout();
 
-      expect(fs.existsSync(testTokenPath)).toBe(false);
-      expect(OAuthManager.cachedToken).toBeNull();
+      expect(fs.existsSync(STATE_PATH)).toBe(false);
+      expect(fs.existsSync(TOKEN_PATH)).toBe(false);
+      expect(OAuthManager.refreshPromises.size).toBe(0);
     });
 
-    it('should not throw error if token file does not exist', () => {
+    it('does not throw when nothing is stored', () => {
       expect(() => OAuthManager.logout()).not.toThrow();
     });
   });
@@ -268,141 +610,4 @@ describe('OAuthManager', () => {
       ).rejects.toThrow();
     });
   });
-
-  describe('refreshAccessToken', () => {
-    it('should refresh access token successfully', async () => {
-      const oldTokens = {
-        access_token: 'old-access-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() - 1000
-      };
-      OAuthManager.saveTokens(oldTokens);
-
-      const mockResponse = {
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
-        expires_in: 3600
-      };
-
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token', {
-          grant_type: 'refresh_token',
-          refresh_token: 'test-refresh-token',
-          client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
-        })
-        .reply(200, mockResponse);
-
-      await OAuthManager.refreshAccessToken();
-
-      const updatedTokens = OAuthManager.loadTokens();
-      expect(updatedTokens.access_token).toBe('new-access-token');
-      expect(updatedTokens.refresh_token).toBe('new-refresh-token');
-      expect(updatedTokens.expires_at).toBeGreaterThan(Date.now());
-    });
-
-    it('should prevent concurrent refresh attempts', async () => {
-      const tokens = {
-        access_token: 'old-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() - 1000
-      };
-      OAuthManager.saveTokens(tokens);
-
-      const mockResponse = {
-        access_token: 'new-token',
-        refresh_token: 'new-refresh-token',
-        expires_in: 3600
-      };
-
-      let requestCount = 0;
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token')
-        .times(2)
-        .reply(200, () => {
-          requestCount++;
-          return mockResponse;
-        });
-
-      // Start two refresh operations concurrently
-      const [result1, result2] = await Promise.all([
-        OAuthManager.refreshAccessToken(),
-        OAuthManager.refreshAccessToken()
-      ]);
-
-      // Both should succeed but only one request should be made
-      expect(result1).toEqual(mockResponse);
-      expect(result2).toEqual(mockResponse);
-      expect(requestCount).toBe(1);
-    });
-
-    it('should throw error if no refresh token available', async () => {
-      await expect(OAuthManager.refreshAccessToken()).rejects.toThrow('No refresh token available');
-    });
-  });
-
-  describe('getValidAccessToken', () => {
-    it('should return cached token if valid', async () => {
-      const tokens = {
-        access_token: 'test-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000 // 1 hour from now
-      };
-      OAuthManager.saveTokens(tokens);
-      OAuthManager.cachedToken = 'test-token';
-
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('test-token');
-    });
-
-    it('should refresh token if expired', async () => {
-      const tokens = {
-        access_token: 'old-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() - 1000 // Expired
-      };
-      OAuthManager.saveTokens(tokens);
-
-      const mockResponse = {
-        access_token: 'new-token',
-        refresh_token: 'new-refresh-token',
-        expires_in: 3600
-      };
-
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token')
-        .reply(200, mockResponse);
-
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('new-token');
-    });
-
-    it('should refresh token if expiring soon (within 1 minute)', async () => {
-      const tokens = {
-        access_token: 'old-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 30000 // 30 seconds from now
-      };
-      OAuthManager.saveTokens(tokens);
-
-      const mockResponse = {
-        access_token: 'new-token',
-        refresh_token: 'new-refresh-token',
-        expires_in: 3600
-      };
-
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token')
-        .reply(200, mockResponse);
-
-      const token = await OAuthManager.getValidAccessToken();
-      expect(token).toBe('new-token');
-    });
-
-    it('should throw error if no tokens exist', async () => {
-      await expect(OAuthManager.getValidAccessToken()).rejects.toThrow(
-        'No authentication tokens found. Please authenticate first.'
-      );
-    });
-  });
-
 });

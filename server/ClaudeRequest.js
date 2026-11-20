@@ -127,6 +127,9 @@ class ClaudeRequest {
     this.toolNameMap = null;
 
     this.headerToken = null;
+    // Which pooled account the current attempt is billed to. Set by
+    // loadOrRefreshToken; the 429 path uses it to mark the right account.
+    this.accountId = null;
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
       Logger.debug('Using x-api-key as token for this request');
@@ -221,18 +224,69 @@ class ClaudeRequest {
     return error;
   }
 
+  // The pool exists but every account is serving out a 429. 429 tells the
+  // client to come back after Retry-After rather than re-authenticate.
+  rateLimitError(count, resetMs) {
+    // A state file can hold anything; toISOString throws above this bound, and
+    // an error about a rate limit must not itself become a 401.
+    const usableResetMs = Number.isFinite(resetMs) && resetMs > 0 && resetMs <= 8.64e15
+      ? resetMs
+      : null;
+    const suffix = usableResetMs ? `; earliest reset at ${new Date(usableResetMs).toISOString()}` : '';
+    const error = new Error(`All ${count} OAuth accounts are rate limited${suffix}`);
+    error.statusCode = 429;
+    error.userFacing = true;
+    if (usableResetMs) {
+      error.retryAfterSeconds = Math.max(1, Math.ceil((usableResetMs - Date.now()) / 1000));
+    }
+    return error;
+  }
+
+  // anthropic-ratelimit-unified-reset is epoch seconds (milliseconds once the
+  // number is large enough to be one), retry-after is seconds or an HTTP date.
+  // null means neither was usable, and the caller falls back to a fixed cooldown.
+  static limitResetAtMs(headers) {
+    if (!headers) return null;
+
+    const unified = headers['anthropic-ratelimit-unified-reset'];
+    if (unified !== undefined && unified !== null && String(unified).trim() !== '') {
+      const value = Number(unified);
+      if (Number.isFinite(value) && value > 0) {
+        return value > 1e12 ? value : value * 1000;
+      }
+    }
+
+    const retryAfter = headers['retry-after'];
+    if (retryAfter !== undefined && retryAfter !== null && String(retryAfter).trim() !== '') {
+      const raw = String(retryAfter).trim();
+      if (/^\d+$/.test(raw)) {
+        return Date.now() + parseInt(raw, 10) * 1000;
+      }
+      const parsed = Date.parse(raw);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+
+    return null;
+  }
+
   async loadOrRefreshToken({ force = false } = {}) {
     try {
-      // Try OAuthManager's stored tokens first
+      // Try OAuthManager's account pool first
       if (OAuthManager.isAuthenticated()) {
-        Logger.debug('Using OAuthManager tokens');
+        const account = OAuthManager.getActiveAccount();
+        if (!account) {
+          throw this.rateLimitError(OAuthManager.accountCount(), OAuthManager.getEarliestResetMs());
+        }
+
+        this.accountId = account.id;
+        Logger.debug(`Using OAuth account ${account.label}`);
+
         if (force) {
           Logger.info('Forcing OAuth token refresh');
-          const response = await OAuthManager.refreshAccessToken();
+          const response = await OAuthManager.refreshAccessToken(account.id);
           return `Bearer ${response.access_token}`;
         }
-        const token = await OAuthManager.getValidAccessToken();
-        return `Bearer ${token}`;
+        return `Bearer ${await OAuthManager.getValidAccessToken(account.id)}`;
       }
 
       // Fallback to Claude Code credentials if enabled
@@ -403,11 +457,21 @@ class ClaudeRequest {
   }
 
   // Startup used to report "Not authenticated" whenever the proxy had no
-  // tokens.json of its own, even though every request succeeded through the
+  // account of its own, even though every request succeeded through the
   // Claude Code fallback. Report what will actually be used.
   static describeCredentialSource() {
     if (OAuthManager.isAuthenticated()) {
-      return { source: 'proxy', expiresAt: OAuthManager.getTokenExpiration(), expired: false };
+      const status = OAuthManager.getStatus();
+      const active = status.accounts.find(a => a.active) || null;
+      return {
+        source: 'proxy',
+        accountCount: status.accounts.length,
+        activeLabel: active ? active.label : null,
+        expiresAt: active && active.expires_at ? new Date(active.expires_at) : null,
+        allLimited: status.all_limited,
+        earliestResetAt: status.earliest_reset_at ? new Date(status.earliest_reset_at) : null,
+        expired: false
+      };
     }
 
     if (!FALLBACK_TO_CLAUDE_CODE) {
@@ -598,18 +662,23 @@ class ClaudeRequest {
   }
 
   async handleResponse(res, body, presetName = null) {
-    return this.proxyUpstream(res, (token) => this.makeRequest(body, presetName, token));
+    return this.proxyUpstream(
+      res,
+      (token) => this.makeRequest(body, presetName, token),
+      { failoverOn429: true }
+    );
   }
 
   async handleModels(res, search = '') {
     return this.proxyUpstream(res, (token) => this.makeGetRequest(`/v1/models${search}`, token));
   }
 
-  // Single place that owns the 401-retry, header copy and body forwarding for
-  // every upstream call. send(token) receives null on the first attempt.
-  async proxyUpstream(res, send) {
+  // Single place that owns the 401-retry, 429 failover, header copy and body
+  // forwarding for every upstream call. send(token) receives null on the first
+  // attempt and re-selects the active account on every later one.
+  async proxyUpstream(res, send, { failoverOn429 = false } = {}) {
     try {
-      const claudeResponse = await send(null);
+      let claudeResponse = await send(null);
 
       // A 401 on a client-supplied x-api-key is the client's problem: do not
       // silently retry it with the proxy owner's subscription credentials.
@@ -618,19 +687,52 @@ class ClaudeRequest {
 
         try {
           const newToken = await this.loadOrRefreshToken({ force: true });
-          claudeResponse.destroy();
+          // Ask for the retry before destroying the 401: if the retry throws,
+          // the original response is still readable and gets forwarded.
           const retryResponse = await send(newToken);
-          res.statusCode = retryResponse.statusCode;
-          Logger.debug(`Claude API retry status: ${retryResponse.statusCode}`);
-          Logger.debug('Claude retry response headers:', JSON.stringify(retryResponse.headers, null, 2));
-          this.copyResponseHeaders(res, retryResponse);
-          this.streamResponse(res, retryResponse);
-          return;
+          claudeResponse.destroy();
+          claudeResponse = retryResponse;
+          Logger.debug(`Claude API retry status: ${claudeResponse.statusCode}`);
         } catch (error) {
           Logger.info(`Token load/refresh failed, passing 401 to client: ${error.message}`);
         }
       } else if (claudeResponse.statusCode === 401) {
         Logger.info('Got 401 for client-supplied x-api-key, passing it through');
+      }
+
+      // Only a 429 on a pooled account fails over. A client key and the
+      // read-only Claude Code fallback are single credentials by design.
+      if (failoverOn429 && !this.headerToken && this.accountId && claudeResponse.statusCode === 429) {
+        const maxAttempts = OAuthManager.accountCount();
+        let attempts = 0;
+
+        while (attempts < maxAttempts && this.accountId) {
+          const next = OAuthManager.markAccountLimited(this.accountId, {
+            resetAtMs: ClaudeRequest.limitResetAtMs(claudeResponse.headers),
+            reason: 'rate_limit'
+          });
+          // No usable account left: forward this 429 untouched so the client
+          // sees the real error body and headers.
+          if (!next) break;
+
+          attempts += 1;
+          Logger.warn(`Account ${this.accountId} rate limited, retrying on ${next.label}`);
+
+          let retryResponse;
+          try {
+            // send(null) re-enters loadOrRefreshToken, which advances the
+            // active pointer and re-derives the billing ids from the new token.
+            retryResponse = await send(null);
+          } catch (error) {
+            if (!claudeResponse.destroyed) claudeResponse.destroy();
+            throw error;
+          }
+
+          claudeResponse.destroy();
+          claudeResponse = retryResponse;
+
+          if (claudeResponse.statusCode !== 429) break;
+        }
       }
 
       res.statusCode = claudeResponse.statusCode;
@@ -642,7 +744,11 @@ class ClaudeRequest {
 
     } catch (error) {
       Logger.error('Claude request error:', error.message);
-      res.writeHead(error.statusCode || 500, { 'Content-Type': 'application/json' });
+      const headers = { 'Content-Type': 'application/json' };
+      if (error.retryAfterSeconds) {
+        headers['Retry-After'] = String(error.retryAfterSeconds);
+      }
+      res.writeHead(error.statusCode || 500, headers);
       res.end(JSON.stringify({ error: error.message }));
     }
   }

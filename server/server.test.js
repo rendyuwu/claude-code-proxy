@@ -1,10 +1,11 @@
-const request = require('supertest');
+// Route-level tests that drive the real handleRequest with the real
+// OAuthManager, pointed at a temporary account store.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const nock = require('nock');
+const request = require('supertest');
 
-// Mock Logger before requiring server
 jest.mock('./Logger', () => ({
   info: jest.fn(),
   debug: jest.fn(),
@@ -15,388 +16,335 @@ jest.mock('./Logger', () => ({
 }));
 
 const OAuthManager = require('./OAuthManager');
+const { handleRequest } = require('./server');
 
-// Import server components after mocking
-const url = require('url');
-const parseBody = (req) => {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-    req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (error) {
-        reject(new Error(`Invalid JSON: ${error.message}`));
-      }
-    });
-    req.on('error', reject);
-  });
+const TEST_DIR = path.join(__dirname, '.test-server-accounts');
+const STATE_PATH = path.join(TEST_DIR, 'accounts.json');
+const TOKEN_PATH = path.join(TEST_DIR, 'tokens.json');
+
+const server = () => http.createServer(handleRequest);
+
+const tokensFor = (suffix) => ({
+  access_token: `access-${suffix}`,
+  refresh_token: `refresh-${suffix}`,
+  expires_in: 3600,
+  account: { uuid: `uuid-${suffix}`, email_address: `${suffix}@example.com` },
+  organization: { uuid: `org-${suffix}` }
+});
+
+const startLogin = async () => {
+  const response = await request(server()).get('/auth/get-url');
+  expect(response.status).toBe(200);
+  return response.body.state;
 };
 
-describe('OAuth Routes Integration Tests', () => {
-  let server;
-  let testTokenPath;
-  let pkceStates;
+const completeLogin = async (tokens) => {
+  const state = await startLogin();
+  const tokenScope = nock('https://console.anthropic.com')
+    .post('/v1/oauth/token')
+    .reply(200, tokens);
 
-  beforeAll(() => {
-    // Mock the config file
-    const configPath = path.join(__dirname, 'config.txt');
-    const originalReadFileSync = fs.readFileSync;
+  const response = await request(server())
+    .get('/auth/callback')
+    .query({ manual_code: `test-code#${state}` });
 
-    jest.spyOn(fs, 'readFileSync').mockImplementation((filePath, encoding) => {
-      if (filePath === configPath) {
-        return 'port=42069\nhost=\nlog_level=INFO\nauto_open_browser=false\nfallback_to_claude_code=false';
-      }
-      return originalReadFileSync(filePath, encoding);
+  expect(tokenScope.isDone()).toBe(true);
+  return response;
+};
+
+beforeAll(() => {
+  nock.disableNetConnect();
+  nock.enableNetConnect('127.0.0.1');
+});
+
+afterAll(() => {
+  nock.enableNetConnect();
+});
+
+beforeEach(() => {
+  nock.cleanAll();
+  OAuthManager.statePath = STATE_PATH;
+  OAuthManager.tokenPath = TOKEN_PATH;
+  OAuthManager.refreshPromises.clear();
+
+  if (fs.existsSync(TEST_DIR)) {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  }
+});
+
+afterEach(() => {
+  if (fs.existsSync(TEST_DIR)) {
+    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  }
+  nock.cleanAll();
+  delete process.env.PROXY_API_KEY;
+  delete process.env.AUTH_ROUTES_ENABLED;
+});
+
+describe('GET /auth/get-url', () => {
+  it('returns an authorize URL and a state', async () => {
+    const response = await request(server()).get('/auth/get-url');
+
+    expect(response.status).toBe(200);
+    expect(response.body.url).toContain('https://claude.ai/oauth/authorize');
+    expect(response.body.url).toContain('client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e');
+    expect(response.body.url).toContain('code_challenge_method=S256');
+    expect(response.body.state).toEqual(expect.any(String));
+  });
+});
+
+describe('GET /auth/login', () => {
+  it('serves the login page', async () => {
+    const response = await request(server()).get('/auth/login');
+
+    expect(response.status).toBe(200);
+    expect(response.text).toContain('Authenticate with Claude');
+  });
+});
+
+describe('GET /auth/callback', () => {
+  it('registers an account from the token response', async () => {
+    const response = await completeLogin(tokensFor('a'));
+
+    expect(response.status).toBe(200);
+    expect(response.text).toContain('Authentication Successful');
+
+    const status = OAuthManager.getStatus();
+    expect(status.authenticated).toBe(true);
+    expect(status.accounts).toHaveLength(1);
+    expect(status.accounts[0]).toMatchObject({
+      label: 'a@example.com',
+      email: 'a@example.com',
+      active: true,
+      limited: false
     });
+    expect(status.active_account_id).toBe(status.accounts[0].id);
   });
 
-  beforeEach(() => {
-    // Use a temporary directory for testing
-    testTokenPath = path.join(__dirname, '.test-tokens-integration', 'tokens.json');
-    OAuthManager.tokenPath = testTokenPath;
-    OAuthManager.cachedToken = null;
-    OAuthManager.refreshPromise = null;
+  it('appends a second identity without moving the active account', async () => {
+    await completeLogin(tokensFor('a'));
+    const first = OAuthManager.getStatus();
 
-    // Clean up test directory
-    const testDir = path.dirname(testTokenPath);
-    if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
-    }
+    await completeLogin(tokensFor('b'));
+    const second = OAuthManager.getStatus();
 
-    // Initialize PKCE states map
-    pkceStates = new Map();
+    expect(second.accounts).toHaveLength(2);
+    expect(second.active_account_id).toBe(first.active_account_id);
+    expect(second.accounts.find(a => a.active).label).toBe('a@example.com');
+  });
 
-    // Create test server with OAuth routes
-    const handleRequest = async (req, res) => {
-      const parsedUrl = url.parse(req.url, true);
-      const pathname = parsedUrl.pathname;
+  it('replaces the tokens of a re-logged identity and clears its limit', async () => {
+    await completeLogin(tokensFor('a'));
+    await completeLogin(tokensFor('b'));
 
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    const before = OAuthManager.getStatus();
+    const firstId = before.accounts.find(a => a.label === 'a@example.com').id;
 
-      if (req.method === 'OPTIONS') {
-        res.writeHead(200);
-        res.end();
-        return;
-      }
+    // Limit the first account so the retry state is visibly reset by a login.
+    OAuthManager.markAccountLimited(firstId, { resetAtMs: Date.now() + 60000 });
+    expect(OAuthManager.getStatus().accounts.find(a => a.id === firstId).limited).toBe(true);
 
-      // OAuth Routes
-      if (pathname === '/auth/login' && req.method === 'GET') {
-        try {
-          const pkce = OAuthManager.generatePKCE();
-          pkceStates.set(pkce.state, {
-            code_verifier: pkce.code_verifier,
-            created_at: Date.now()
-          });
+    const relogin = tokensFor('a');
+    relogin.access_token = 'access-a-new';
+    relogin.refresh_token = 'refresh-a-new';
+    await completeLogin(relogin);
 
-          const authUrl = OAuthManager.buildAuthorizationURL(pkce);
-          res.writeHead(302, { 'Location': authUrl });
-          res.end();
-        } catch (error) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Failed to initiate OAuth login' }));
-        }
-        return;
-      }
+    const after = OAuthManager.getStatus();
+    expect(after.accounts).toHaveLength(2);
+    expect(after.accounts.find(a => a.id === firstId)).toMatchObject({
+      label: 'a@example.com',
+      limited: false,
+      limited_until: null
+    });
 
-      if (pathname === '/auth/callback' && req.method === 'GET') {
-        try {
-          const query = parsedUrl.query;
-          const code = query.code;
-          const state = query.state;
+    const stored = OAuthManager.loadState().accounts.find(a => a.id === firstId);
+    expect(stored.access_token).toBe('access-a-new');
+    expect(stored.refresh_token).toBe('refresh-a-new');
+    expect(stored.limited_until).toBeNull();
+  });
 
-          if (!code || !state) {
-            throw new Error('Missing authorization code or state');
-          }
+  it('resolves identity from the profile when the token response omits it', async () => {
+    await completeLogin(tokensFor('a'));
+    expect(OAuthManager.accountCount()).toBe(1);
 
-          const pkceData = pkceStates.get(state);
-          if (!pkceData) {
-            throw new Error('Invalid or expired state parameter');
-          }
+    nock('https://api.anthropic.com')
+      .get('/api/oauth/profile')
+      .reply(200, {
+        account: { uuid: 'uuid-a', email: 'a@example.com' },
+        organization: { uuid: 'org-a' }
+      });
 
-          pkceStates.delete(state);
-
-          const tokens = await OAuthManager.exchangeCodeForTokens(code, pkceData.code_verifier);
-
-          const tokenData = {
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
-            expires_at: Date.now() + (tokens.expires_in * 1000)
-          };
-          OAuthManager.saveTokens(tokenData);
-
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<html><body><h1>Authentication Successful!</h1></body></html>');
-        } catch (error) {
-          res.writeHead(500, { 'Content-Type': 'text/html' });
-          res.end(`
-            <!DOCTYPE html>
-            <html>
-            <head><title>Authentication Failed</title></head>
-            <body>
-              <h1>Authentication Failed</h1>
-              <p>Error: ${error.message}</p>
-            </body>
-            </html>
-          `);
-        }
-        return;
-      }
-
-      if (pathname === '/auth/status' && req.method === 'GET') {
-        try {
-          const isAuthenticated = OAuthManager.isAuthenticated();
-          const expiration = OAuthManager.getTokenExpiration();
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({
-            authenticated: isAuthenticated,
-            expires_at: expiration ? expiration.toISOString() : null
-          }));
-        } catch (error) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Failed to check authentication status' }));
-        }
-        return;
-      }
-
-      if (pathname === '/auth/logout' && req.method === 'GET') {
-        try {
-          OAuthManager.logout();
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, message: 'Logged out successfully' }));
-        } catch (error) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Failed to logout' }));
-        }
-        return;
-      }
-
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not found' }));
+    const anonymous = {
+      access_token: 'access-anonymous',
+      refresh_token: 'refresh-anonymous',
+      expires_in: 3600
     };
+    await completeLogin(anonymous);
 
-    server = http.createServer(handleRequest);
+    const status = OAuthManager.getStatus();
+    expect(status.accounts).toHaveLength(1);
+    expect(status.accounts[0].label).toBe('a@example.com');
+    expect(OAuthManager.loadState().accounts[0].access_token).toBe('access-anonymous');
+  });
 
-    // Start server on a random port for testing
-    return new Promise((resolve) => {
-      server.listen(0, '127.0.0.1', () => {
-        resolve();
-      });
+  it('returns error if code is missing', async () => {
+    const response = await request(server()).get('/auth/callback?state=test-state');
+
+    expect(response.status).toBe(500);
+    expect(response.text).toContain('Authentication Failed');
+    expect(response.text).toContain('Missing authorization code or state');
+  });
+
+  it('returns error if state is missing', async () => {
+    const response = await request(server()).get('/auth/callback?code=test-code');
+
+    expect(response.status).toBe(500);
+    expect(response.text).toContain('Missing authorization code or state');
+  });
+
+  it('returns error if state is invalid', async () => {
+    const response = await request(server()).get('/auth/callback?code=test-code&state=invalid-state');
+
+    expect(response.status).toBe(500);
+    expect(response.text).toContain('Invalid or expired state parameter');
+  });
+});
+
+describe('GET /auth/status', () => {
+  it('reports no authentication when the store is empty', async () => {
+    const response = await request(server()).get('/auth/status');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      authenticated: false,
+      active_account_id: null,
+      expires_at: null,
+      accounts: []
     });
   });
 
-  afterEach((done) => {
-    // Clean up
-    const testDir = path.dirname(testTokenPath);
-    if (fs.existsSync(testDir)) {
-      fs.rmSync(testDir, { recursive: true, force: true });
-    }
-    nock.cleanAll();
+  it('lists sanitized accounts with ISO timestamps', async () => {
+    await completeLogin(tokensFor('a'));
+    await completeLogin(tokensFor('b'));
+    OAuthManager.markAccountLimited(
+      OAuthManager.loadState().accounts[0].id,
+      { resetAtMs: Date.now() + 60000 }
+    );
 
-    if (server) {
-      server.close(done);
-    } else {
-      done();
-    }
+    const response = await request(server()).get('/auth/status');
+
+    expect(response.status).toBe(200);
+    expect(response.body.authenticated).toBe(true);
+    expect(response.body.accounts).toHaveLength(2);
+    expect(response.body.expires_at).toEqual(expect.any(String));
+
+    const body = JSON.stringify(response.body);
+    expect(body).not.toContain('access_token');
+    expect(body).not.toContain('refresh_token');
+    expect(body).not.toContain('access-');
+
+    const limited = response.body.accounts.find(a => a.limited);
+    expect(limited.limited_until).toEqual(expect.any(String));
+    expect(new Date(limited.limited_until).getTime()).toBeGreaterThan(Date.now());
+  });
+});
+
+describe('GET /auth/logout', () => {
+  it('removes every account and reports logged out', async () => {
+    await completeLogin(tokensFor('a'));
+    expect(OAuthManager.isAuthenticated()).toBe(true);
+
+    const logout = await request(server()).get('/auth/logout');
+
+    expect(logout.status).toBe(200);
+    expect(logout.body).toEqual({ success: true, message: 'Logged out successfully' });
+    expect(OAuthManager.accountCount()).toBe(0);
+
+    const status = await request(server()).get('/auth/status');
+    expect(status.body.authenticated).toBe(false);
+    expect(status.body.accounts).toEqual([]);
   });
 
-  afterAll(() => {
-    jest.restoreAllMocks();
+  it('succeeds when nothing is stored', async () => {
+    const response = await request(server()).get('/auth/logout');
+
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+  });
+});
+
+describe('POST /v1/messages 429 failover', () => {
+  const SONNET = 'claude-sonnet-4-5-20250929';
+
+  const addAccount = (suffix) => OAuthManager.addAccount({
+    access_token: `token-${suffix}`,
+    refresh_token: `refresh-${suffix}`,
+    expires_at: Date.now() + 3600000
+  }, {
+    account_uuid: `uuid-${suffix}`,
+    organization_uuid: `org-${suffix}`,
+    email: `${suffix}@example.com`
   });
 
-  describe('GET /auth/login', () => {
-    it('should redirect to OAuth authorization URL', async () => {
-      const response = await request(server).get('/auth/login');
+  it('retries on the next stored account and persists the limit', async () => {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    const authorizations = [];
 
-      expect(response.status).toBe(302);
-      expect(response.headers.location).toContain('https://claude.ai/oauth/authorize');
-      expect(response.headers.location).toContain('client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e');
-      expect(response.headers.location).toContain('response_type=code');
-      expect(response.headers.location).toContain('code_challenge=');
-      expect(response.headers.location).toContain('code_challenge_method=S256');
-      expect(response.headers.location).toContain('state=');
-    });
+    addAccount('a1');
+    const second = addAccount('a2');
 
-    it('should store PKCE state for callback verification', async () => {
-      const response = await request(server).get('/auth/login');
-
-      const locationUrl = new URL(response.headers.location);
-      const state = locationUrl.searchParams.get('state');
-
-      expect(pkceStates.has(state)).toBe(true);
-      expect(pkceStates.get(state)).toHaveProperty('code_verifier');
-      expect(pkceStates.get(state)).toHaveProperty('created_at');
-    });
-  });
-
-  describe('GET /auth/callback', () => {
-    it('should exchange code for tokens and save them', async () => {
-      // First, initiate login to get state
-      const loginResponse = await request(server).get('/auth/login');
-      const locationUrl = new URL(loginResponse.headers.location);
-      const state = locationUrl.searchParams.get('state');
-
-      // Mock the token exchange
-      const mockTokens = {
-        access_token: 'mock-access-token',
-        refresh_token: 'mock-refresh-token',
-        expires_in: 3600
-      };
-
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token')
-        .reply(200, mockTokens);
-
-      // Make callback request
-      const response = await request(server)
-        .get(`/auth/callback?code=test-code&state=${state}`);
-
-      expect(response.status).toBe(200);
-      expect(response.text).toContain('Authentication Successful');
-
-      // Verify tokens were saved
-      const savedTokens = OAuthManager.loadTokens();
-      expect(savedTokens).toBeTruthy();
-      expect(savedTokens.access_token).toBe('mock-access-token');
-      expect(savedTokens.refresh_token).toBe('mock-refresh-token');
-    });
-
-    it('should return error if code is missing', async () => {
-      const response = await request(server)
-        .get('/auth/callback?state=test-state');
-
-      expect(response.status).toBe(500);
-      expect(response.text).toContain('Authentication Failed');
-      expect(response.text).toContain('Missing authorization code or state');
-    });
-
-    it('should return error if state is missing', async () => {
-      const response = await request(server)
-        .get('/auth/callback?code=test-code');
-
-      expect(response.status).toBe(500);
-      expect(response.text).toContain('Authentication Failed');
-      expect(response.text).toContain('Missing authorization code or state');
-    });
-
-    it('should return error if state is invalid', async () => {
-      const response = await request(server)
-        .get('/auth/callback?code=test-code&state=invalid-state');
-
-      expect(response.status).toBe(500);
-      expect(response.text).toContain('Authentication Failed');
-      expect(response.text).toContain('Invalid or expired state parameter');
-    });
-
-    it('should delete state after successful callback', async () => {
-      // First, initiate login to get state
-      const loginResponse = await request(server).get('/auth/login');
-      const locationUrl = new URL(loginResponse.headers.location);
-      const state = locationUrl.searchParams.get('state');
-
-      expect(pkceStates.has(state)).toBe(true);
-
-      // Mock the token exchange
-      const mockTokens = {
-        access_token: 'mock-access-token',
-        refresh_token: 'mock-refresh-token',
-        expires_in: 3600
-      };
-
-      nock('https://console.anthropic.com')
-        .post('/v1/oauth/token')
-        .reply(200, mockTokens);
-
-      // Make callback request
-      await request(server)
-        .get(`/auth/callback?code=test-code&state=${state}`);
-
-      // State should be deleted
-      expect(pkceStates.has(state)).toBe(false);
-    });
-  });
-
-  describe('GET /auth/status', () => {
-    it('should return not authenticated when no tokens exist', async () => {
-      const response = await request(server).get('/auth/status');
-
-      expect(response.status).toBe(200);
-      expect(response.body).toEqual({
-        authenticated: false,
-        expires_at: null
-      });
-    });
-
-    it('should return authenticated when tokens exist', async () => {
-      const expiresAt = Date.now() + 3600000;
-      const tokens = {
-        access_token: 'test-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: expiresAt
-      };
-      OAuthManager.saveTokens(tokens);
-
-      const response = await request(server).get('/auth/status');
-
-      expect(response.status).toBe(200);
-      expect(response.body.authenticated).toBe(true);
-      expect(response.body.expires_at).toBeTruthy();
-    });
-  });
-
-  describe('GET /auth/logout', () => {
-    it('should delete tokens and return success', async () => {
-      // Save some tokens first
-      const tokens = {
-        access_token: 'test-token',
-        refresh_token: 'test-refresh-token',
-        expires_at: Date.now() + 3600000
-      };
-      OAuthManager.saveTokens(tokens);
-
-      expect(OAuthManager.isAuthenticated()).toBe(true);
-
-      const response = await request(server).get('/auth/logout');
-
-      expect(response.status).toBe(200);
-      expect(response.body).toEqual({
-        success: true,
-        message: 'Logged out successfully'
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        authorizations.push(this.req.headers.authorization);
+        return [
+          429,
+          JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } }),
+          {
+            'content-type': 'application/json',
+            'anthropic-ratelimit-unified-reset': String(resetSec)
+          }
+        ];
       });
 
-      expect(OAuthManager.isAuthenticated()).toBe(false);
-    });
-
-    it('should succeed even if no tokens exist', async () => {
-      const response = await request(server).get('/auth/logout');
-
-      expect(response.status).toBe(200);
-      expect(response.body).toEqual({
-        success: true,
-        message: 'Logged out successfully'
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(function () {
+        authorizations.push(this.req.headers.authorization);
+        return [200, JSON.stringify({ id: 'msg_2' }), { 'content-type': 'application/json' }];
       });
-    });
+
+    const response = await request(server())
+      .post('/v1/messages')
+      .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe('msg_2');
+    expect(authorizations).toEqual(['Bearer token-a1', 'Bearer token-a2']);
+
+    const state = OAuthManager.loadState();
+    expect(state.active_account_id).toBe(second.id);
+    const limited = state.accounts.find(a => a.email === 'a1@example.com');
+    expect(limited.limited_until).toBe(resetSec * 1000);
+    expect(limited.limited_reason).toBe('rate_limit');
+  });
+});
+
+describe('CORS headers', () => {
+  it('includes CORS headers in all responses', async () => {
+    const response = await request(server()).get('/auth/status');
+
+    expect(response.headers['access-control-allow-origin']).toBe('*');
+    expect(response.headers['access-control-allow-methods']).toBe('GET, POST, PUT, DELETE, OPTIONS');
+    expect(response.headers['access-control-allow-headers']).toBe('Content-Type, Authorization, X-Requested-With');
   });
 
-  describe('CORS headers', () => {
-    it('should include CORS headers in all responses', async () => {
-      const response = await request(server).get('/auth/status');
+  it('handles OPTIONS requests', async () => {
+    const response = await request(server()).options('/auth/status');
 
-      expect(response.headers['access-control-allow-origin']).toBe('*');
-      expect(response.headers['access-control-allow-methods']).toBe('GET, POST, PUT, DELETE, OPTIONS');
-      expect(response.headers['access-control-allow-headers']).toBe('Content-Type, Authorization, X-Requested-With');
-    });
-
-    it('should handle OPTIONS requests', async () => {
-      const response = await request(server).options('/auth/status');
-
-      expect(response.status).toBe(200);
-      expect(response.headers['access-control-allow-origin']).toBe('*');
-    });
+    expect(response.status).toBe(200);
+    expect(response.headers['access-control-allow-origin']).toBe('*');
   });
 });
