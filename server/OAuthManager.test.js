@@ -544,6 +544,200 @@ describe('OAuthManager', () => {
       expect(OAuthManager.markAccountLimited(a.id)).toBeNull();
       expect(OAuthManager.accountCount()).toBe(1);
     });
+
+    it('stores the 5-hour window end the 429 carried', () => {
+      const a = addAccount('a');
+      addAccount('b');
+      const resetAt = Date.now() + 900000;
+      const fiveHourAt = Date.now() + 3600000;
+
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: resetAt, fiveHourResetAtMs: fiveHourAt });
+
+      const stored = readState().accounts[0];
+      expect(stored.limited_until).toBe(resetAt);
+      expect(stored.five_hour_reset_at).toBe(fiveHourAt);
+    });
+
+    it('leaves the 5-hour window alone when the 429 carried no 5-hour header', () => {
+      const a = addAccount('a');
+      addAccount('b');
+
+      OAuthManager.markAccountLimited(a.id, { resetAtMs: Date.now() + 900000 });
+
+      expect(readState().accounts[0].five_hour_reset_at).toBeNull();
+    });
+  });
+
+  describe('five hour reset tracking', () => {
+    const patchAccount = (id, patch) => {
+      const state = readState();
+      Object.assign(state.accounts.find(a => a.id === id), patch);
+      OAuthManager.saveState(state);
+    };
+
+    const candidateIds = (now) => OAuthManager.getAutoPingCandidates(now).map(a => a.id);
+
+    describe('recordFiveHourReset', () => {
+      it('stores a future reset', () => {
+        const a = addAccount('a');
+        const resetAt = Date.now() + 3600000;
+
+        OAuthManager.recordFiveHourReset(a.id, resetAt);
+
+        expect(readState().accounts[0].five_hour_reset_at).toBe(resetAt);
+      });
+
+      it('ignores a reset that is already in the past', () => {
+        const a = addAccount('a');
+
+        OAuthManager.recordFiveHourReset(a.id, Date.now() - 60000);
+
+        expect(readState().accounts[0].five_hour_reset_at).toBeNull();
+      });
+
+      it('ignores junk values without throwing', () => {
+        const a = addAccount('a');
+
+        expect(() => {
+          OAuthManager.recordFiveHourReset(a.id, null);
+          OAuthManager.recordFiveHourReset(a.id, NaN);
+          OAuthManager.recordFiveHourReset(a.id, 'soon');
+          OAuthManager.recordFiveHourReset('missing-account', Date.now() + 60000);
+        }).not.toThrow();
+
+        expect(readState().accounts[0].five_hour_reset_at).toBeNull();
+      });
+
+      it('keeps the later of two resets', () => {
+        const a = addAccount('a');
+        const later = Date.now() + 3600000;
+
+        OAuthManager.recordFiveHourReset(a.id, later);
+        OAuthManager.recordFiveHourReset(a.id, later - 600000);
+        expect(readState().accounts[0].five_hour_reset_at).toBe(later);
+
+        OAuthManager.recordFiveHourReset(a.id, later + 600000);
+        expect(readState().accounts[0].five_hour_reset_at).toBe(later + 600000);
+      });
+
+      it('caps a reset at six hours out', () => {
+        const a = addAccount('a');
+        const before = Date.now();
+        const sixHours = 6 * 60 * 60 * 1000;
+
+        OAuthManager.recordFiveHourReset(a.id, before + 30 * 24 * 60 * 60 * 1000);
+
+        const stored = readState().accounts[0].five_hour_reset_at;
+        expect(stored).toBeGreaterThanOrEqual(before + sixHours);
+        expect(stored).toBeLessThanOrEqual(before + sixHours + 1000);
+      });
+    });
+
+    describe('recordAutoPingResult', () => {
+      it('stores the header reset and the ping time', () => {
+        const a = addAccount('a');
+        const resetAt = Date.now() + 3600000;
+
+        OAuthManager.recordAutoPingResult(a.id, resetAt);
+
+        const stored = readState().accounts[0];
+        expect(stored.five_hour_reset_at).toBe(resetAt);
+        expect(stored.auto_ping_last_at).toBeGreaterThan(Date.now() - 5000);
+      });
+
+      it('falls back to five hours when the response named no reset', () => {
+        const a = addAccount('a');
+        const before = Date.now();
+
+        OAuthManager.recordAutoPingResult(a.id, null);
+
+        const stored = readState().accounts[0].five_hour_reset_at;
+        expect(stored).toBeGreaterThanOrEqual(before + (5 * 60 * 60 * 1000));
+        expect(stored).toBeLessThanOrEqual(before + (5 * 60 * 60 * 1000) + 1000);
+      });
+    });
+
+    describe('getAutoPingCandidates', () => {
+      it('counts a new account with no timestamps as due', () => {
+        const a = addAccount('a');
+
+        expect(candidateIds()).toEqual([a.id]);
+      });
+
+      it('counts an account whose 5-hour reset has passed', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, { five_hour_reset_at: now - 60000 });
+
+        expect(candidateIds(now)).toEqual([a.id]);
+      });
+
+      it('leaves an account whose 5-hour reset is a minute away alone', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, { five_hour_reset_at: now + 60000 });
+
+        expect(candidateIds(now)).toEqual([]);
+      });
+
+      it('skips a disabled account', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, { disabled: true, five_hour_reset_at: now - 60000 });
+
+        expect(candidateIds(now)).toEqual([]);
+      });
+
+      it('skips an account still serving a longer rate limit', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, {
+          limited_until: now + 86400000,
+          five_hour_reset_at: now - 60000
+        });
+
+        expect(candidateIds(now)).toEqual([]);
+      });
+
+      it('skips an account with no usable token pair', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, { five_hour_reset_at: now - 60000, refresh_token: null });
+
+        expect(candidateIds(now)).toEqual([]);
+      });
+
+      it('uses a future 5-hour reset over a stale past rate limit', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, {
+          limited_until: now - 60000,
+          five_hour_reset_at: now + 600000
+        });
+
+        expect(candidateIds(now)).toEqual([]);
+      });
+
+      it('uses limited_until as the target when no 5-hour reset is known', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        // Five seconds past the limit end, still inside the grace window: due
+        // only if the limit end is the target rather than "no window known".
+        patchAccount(a.id, { limited_until: now - 5000 });
+
+        expect(candidateIds(now)).toEqual([]);
+        expect(candidateIds(now + 10000)).toEqual([a.id]);
+      });
+
+      it('uses the last ping plus five hours when no reset is known', () => {
+        const a = addAccount('a');
+        const now = Date.now();
+        patchAccount(a.id, { auto_ping_last_at: now - (4 * 60 * 60 * 1000) });
+
+        expect(candidateIds(now)).toEqual([]);
+        expect(candidateIds(now + (1 * 60 * 60 * 1000) + 10000)).toEqual([a.id]);
+      });
+    });
   });
 
   describe('getStatus', () => {

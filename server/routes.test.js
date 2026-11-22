@@ -22,6 +22,7 @@ jest.mock('./OAuthManager', () => ({
   refreshAccessToken: jest.fn().mockResolvedValue({ access_token: 'refreshed-access-token' }),
   accountCount: jest.fn().mockReturnValue(1),
   markAccountLimited: jest.fn().mockReturnValue(null),
+  recordFiveHourReset: jest.fn(),
   getEarliestResetMs: jest.fn().mockReturnValue(null),
   getStatus: jest.fn(() => ({
     authenticated: true,

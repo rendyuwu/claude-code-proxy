@@ -429,6 +429,7 @@ describe('POST /v1/messages 429 failover', () => {
 
   it('retries on the next stored account and persists the limit', async () => {
     const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    const fiveHourSec = Math.floor(Date.now() / 1000) + 18000;
     const authorizations = [];
 
     addAccount('a1');
@@ -444,7 +445,8 @@ describe('POST /v1/messages 429 failover', () => {
           JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } }),
           {
             'content-type': 'application/json',
-            'anthropic-ratelimit-unified-reset': String(resetSec)
+            'anthropic-ratelimit-unified-reset': String(resetSec),
+            'anthropic-ratelimit-unified-5h-reset': String(resetSec)
           }
         ];
       });
@@ -454,7 +456,14 @@ describe('POST /v1/messages 429 failover', () => {
       .query({ beta: 'true' })
       .reply(function () {
         authorizations.push(this.req.headers.authorization);
-        return [200, JSON.stringify({ id: 'msg_2' }), { 'content-type': 'application/json' }];
+        return [
+          200,
+          JSON.stringify({ id: 'msg_2' }),
+          {
+            'content-type': 'application/json',
+            'anthropic-ratelimit-unified-5h-reset': String(fiveHourSec)
+          }
+        ];
       });
 
     const response = await request(server())
@@ -470,6 +479,52 @@ describe('POST /v1/messages 429 failover', () => {
     const limited = state.accounts.find(a => a.email === 'a1@example.com');
     expect(limited.limited_until).toBe(resetSec * 1000);
     expect(limited.limited_reason).toBe('rate_limit');
+    expect(limited.five_hour_reset_at).toBe(resetSec * 1000);
+
+    // The successful retry's own header advances the account that served it.
+    const served = state.accounts.find(a => a.email === 'a2@example.com');
+    expect(served.five_hour_reset_at).toBe(fiveHourSec * 1000);
+  });
+});
+
+describe('POST /v1/messages 5-hour window recording', () => {
+  const SONNET = 'claude-sonnet-4-5-20250929';
+
+  it('keeps the response a 200 when the window end cannot be stored', async () => {
+    const resetSec = Math.floor(Date.now() / 1000) + 3600;
+    OAuthManager.addAccount({
+      access_token: 'access-a',
+      refresh_token: 'refresh-a',
+      expires_at: Date.now() + 3600000
+    }, {
+      account_uuid: 'uuid-a',
+      organization_uuid: 'org-a',
+      email: 'a@example.com'
+    });
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, { id: 'msg_1' }, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-5h-reset': String(resetSec)
+      });
+
+    // A full disk must not turn a good upstream answer into a 500.
+    const save = jest.spyOn(OAuthManager, 'saveState').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+
+    try {
+      const response = await request(server())
+        .post('/v1/messages')
+        .send({ model: SONNET, messages: [{ role: 'user', content: 'hi' }] });
+
+      expect(response.status).toBe(200);
+      expect(response.body.id).toBe('msg_1');
+    } finally {
+      save.mockRestore();
+    }
   });
 });
 

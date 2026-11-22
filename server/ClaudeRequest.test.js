@@ -35,6 +35,7 @@ jest.mock('./OAuthManager', () => {
     refreshAccessToken: jest.fn().mockResolvedValue({ access_token: 'refreshed-access-token' }),
     accountCount: jest.fn().mockReturnValue(1),
     markAccountLimited: jest.fn().mockReturnValue(null),
+    recordFiveHourReset: jest.fn(),
     getEarliestResetMs: jest.fn().mockReturnValue(null),
     getStatus: jest.fn(() => ({
       authenticated: true,
@@ -493,7 +494,8 @@ describe('429 failover', () => {
           {
             'content-type': 'application/json',
             'anthropic-ratelimit-unified-status': 'rejected',
-            'anthropic-ratelimit-unified-reset': String(resetSec)
+            'anthropic-ratelimit-unified-reset': String(resetSec),
+            'anthropic-ratelimit-unified-5h-reset': String(resetSec)
           }
         ];
       });
@@ -533,6 +535,7 @@ describe('429 failover', () => {
     expect(OAuthManager.markAccountLimited).toHaveBeenCalledTimes(1);
     expect(OAuthManager.markAccountLimited).toHaveBeenCalledWith('a1', {
       resetAtMs: resetSec * 1000,
+      fiveHourResetAtMs: resetSec * 1000,
       reason: 'rate_limit'
     });
     expect(nock.pendingMocks()).toEqual([]);
@@ -654,6 +657,36 @@ describe('429 failover', () => {
     expect(ClaudeRequest.limitResetAtMs({})).toBeNull();
     expect(ClaudeRequest.limitResetAtMs(null)).toBeNull();
     expect(ClaudeRequest.limitResetAtMs({ 'retry-after': 'garbage' })).toBeNull();
+
+    // The 5-hour window end is not the limit, so it never becomes a cooldown:
+    // doing so benched a healthy account for up to the whole window.
+    expect(ClaudeRequest.limitResetAtMs({ 'anthropic-ratelimit-unified-5h-reset': '1790000000' }))
+      .toBeNull();
+
+    // And a named cooldown still wins over the window end.
+    const beforeRetry = Date.now();
+    const fromRetryAfter = ClaudeRequest.limitResetAtMs({
+      'retry-after': '30',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor(beforeRetry / 1000) + 3600)
+    });
+    expect(fromRetryAfter).toBeLessThanOrEqual(beforeRetry + 31000);
+  });
+
+  it('parses the 5-hour window end from its own header or the representative claim', () => {
+    expect(ClaudeRequest.fiveHourResetAtMs({ 'anthropic-ratelimit-unified-5h-reset': '1790000000' }))
+      .toBe(1790000000000);
+    expect(ClaudeRequest.fiveHourResetAtMs({
+      'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+      'anthropic-ratelimit-unified-reset': '1790000000'
+    })).toBe(1790000000000);
+
+    expect(ClaudeRequest.fiveHourResetAtMs({})).toBeNull();
+    expect(ClaudeRequest.fiveHourResetAtMs(null)).toBeNull();
+    expect(ClaudeRequest.fiveHourResetAtMs({ 'anthropic-ratelimit-unified-5h-reset': 'garbage' })).toBeNull();
+    expect(ClaudeRequest.fiveHourResetAtMs({
+      'anthropic-ratelimit-unified-representative-claim': 'seven_day',
+      'anthropic-ratelimit-unified-reset': '1790000000'
+    })).toBeNull();
   });
 });
 

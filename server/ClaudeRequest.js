@@ -242,19 +242,35 @@ class ClaudeRequest {
     return error;
   }
 
+  // Headers carry epoch seconds, or milliseconds once the number is large
+  // enough to be one. Anything else (empty, non-numeric, non-positive) is null.
+  static epochMs(value) {
+    if (value === undefined || value === null || String(value).trim() === '') return null;
+    const number = Number(value);
+    if (!Number.isFinite(number) || number <= 0) return null;
+    return number > 1e12 ? number : number * 1000;
+  }
+
+  // The 5-hour subscription window's end. It arrives either as its own header
+  // or as the generic reset while the representative claim names that window.
+  static fiveHourResetAtMs(headers) {
+    if (!headers) return null;
+    const direct = ClaudeRequest.epochMs(headers['anthropic-ratelimit-unified-5h-reset']);
+    if (direct) return direct;
+    if (headers['anthropic-ratelimit-unified-representative-claim'] === 'five_hour') {
+      return ClaudeRequest.epochMs(headers['anthropic-ratelimit-unified-reset']);
+    }
+    return null;
+  }
+
   // anthropic-ratelimit-unified-reset is epoch seconds (milliseconds once the
   // number is large enough to be one), retry-after is seconds or an HTTP date.
   // null means neither was usable, and the caller falls back to a fixed cooldown.
   static limitResetAtMs(headers) {
     if (!headers) return null;
 
-    const unified = headers['anthropic-ratelimit-unified-reset'];
-    if (unified !== undefined && unified !== null && String(unified).trim() !== '') {
-      const value = Number(unified);
-      if (Number.isFinite(value) && value > 0) {
-        return value > 1e12 ? value : value * 1000;
-      }
-    }
+    const unified = ClaudeRequest.epochMs(headers['anthropic-ratelimit-unified-reset']);
+    if (unified) return unified;
 
     const retryAfter = headers['retry-after'];
     if (retryAfter !== undefined && retryAfter !== null && String(retryAfter).trim() !== '') {
@@ -266,6 +282,9 @@ class ClaudeRequest {
       if (Number.isFinite(parsed)) return parsed;
     }
 
+    // Deliberately no 5-hour-header fallback: that is when the window ends,
+    // not when the limit does, and it is passed to markAccountLimited
+    // separately. Using it here benched a healthy account for the whole window.
     return null;
   }
 
@@ -715,6 +734,7 @@ class ClaudeRequest {
         while (attempts < maxAttempts && this.accountId) {
           const next = OAuthManager.markAccountLimited(this.accountId, {
             resetAtMs: ClaudeRequest.limitResetAtMs(claudeResponse.headers),
+            fiveHourResetAtMs: ClaudeRequest.fiveHourResetAtMs(claudeResponse.headers),
             reason: 'rate_limit'
           });
           // No usable account left: forward this 429 untouched so the client
@@ -739,6 +759,15 @@ class ClaudeRequest {
 
           if (claudeResponse.statusCode !== 429) break;
         }
+      }
+
+      // The winning response names the 5-hour window end the scheduler waits
+      // for. Client-supplied keys are not pooled accounts, so they are skipped.
+      if (this.accountId && !this.headerToken) {
+        OAuthManager.recordFiveHourReset(
+          this.accountId,
+          ClaudeRequest.fiveHourResetAtMs(claudeResponse.headers)
+        );
       }
 
       res.statusCode = claudeResponse.statusCode;

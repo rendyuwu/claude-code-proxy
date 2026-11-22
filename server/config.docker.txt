@@ -16,3 +16,4 @@ auth_routes_enabled=true  # Set to false to stop serving /auth/* entirely: login
 # OAuth Settings
 auto_open_browser=false  # Disabled for Docker - browser auto-open doesn't work from containers
 fallback_to_claude_code=true  # Use Claude Code credentials as fallback
+auto_ping_enabled=true  # At each pooled OAuth account's 5-hour reset, send a one-token claude-haiku-4-5 request so the next window starts and its countdown appears even when no real traffic arrives. Costs one tiny request per account per window. Set to false to stop it.

@@ -23,6 +23,18 @@ const DEFAULT_LIMIT_COOLDOWN_MS = 5 * 60 * 1000;
 // for years and made the 429 error's ISO date throw.
 const MAX_LIMIT_MS = 7 * 24 * 60 * 60 * 1000;
 
+// The subscription window that starts on any request. Its end arrives in the
+// 5-hour reset header; the fixed value is the fallback when no header does.
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+
+// A 5-hour reset further out than this is junk (or a unit change), so it is
+// capped rather than stored verbatim, same reasoning as MAX_LIMIT_MS.
+const MAX_FIVE_HOUR_RESET_MS = 6 * 60 * 60 * 1000;
+
+// Pinging exactly at the stored reset lands on the boundary and gets a 429;
+// this grace is the smallest margin that avoids it.
+const AUTO_PING_GRACE_MS = 10 * 1000;
+
 // One Anthropic login can belong to several organizations, and one
 // organization can hold several user accounts, so only the pair identifies a
 // credential. Email is the fallback for a migrated single-token account, which
@@ -257,6 +269,8 @@ class OAuthManager {
             limited_until: null,
             limited_reason: null,
             last_limit_at: null,
+            five_hour_reset_at: null,
+            auto_ping_last_at: null,
             created_at: Date.now()
           };
           const state = { active_account_id: account.id, accounts: [account] };
@@ -421,6 +435,8 @@ class OAuthManager {
         limited_until: null,
         limited_reason: null,
         last_limit_at: null,
+        five_hour_reset_at: null,
+        auto_ping_last_at: null,
         disabled: false,
         created_at: now
       };
@@ -537,10 +553,10 @@ class OAuthManager {
   /**
    * Record a 429 for one account and move off it when it was the active one.
    * @param {string} accountId
-   * @param {{resetAtMs?: number|null, reason?: string}} options
+   * @param {{resetAtMs?: number|null, fiveHourResetAtMs?: number|null, reason?: string}} options
    * @returns {Object|null} usable active account
    */
-  markAccountLimited(accountId, { resetAtMs = null, reason = 'rate_limit' } = {}) {
+  markAccountLimited(accountId, { resetAtMs = null, fiveHourResetAtMs = null, reason = 'rate_limit' } = {}) {
     const now = Date.now();
     const state = this.loadState();
     const account = state.accounts.find(a => a.id === accountId);
@@ -554,6 +570,14 @@ class OAuthManager {
       : now + DEFAULT_LIMIT_COOLDOWN_MS;
     account.limited_reason = reason;
     account.last_limit_at = now;
+
+    // The 5-hour window is a separate clock from the rate limit: the account
+    // is unusable until limited_until, but the window end is what the
+    // scheduler waits for to start the next one.
+    const fiveHour = this._storableFiveHourReset(fiveHourResetAtMs, now);
+    if (fiveHour && fiveHour > (account.five_hour_reset_at || 0)) {
+      account.five_hour_reset_at = fiveHour;
+    }
 
     // A late 429 for an account that already lost the slot must not move the
     // pointer past the account now serving traffic.
@@ -677,6 +701,88 @@ class OAuthManager {
       }
     }
     return earliest;
+  }
+
+  /**
+   * A 5-hour reset worth storing, or null. Past values are history, and
+   * anything past the cap is junk, so both are dropped instead of written.
+   * @private
+   */
+  _storableFiveHourReset(resetAtMs, now = Date.now()) {
+    if (!Number.isFinite(resetAtMs) || resetAtMs <= now) return null;
+    return Math.min(resetAtMs, now + MAX_FIVE_HOUR_RESET_MS);
+  }
+
+  /**
+   * Record the 5-hour window end carried by a normal upstream response, so the
+   * scheduler knows when to start the next window. Never throws: this runs on
+   * the client's request path and must not turn a good response into an error.
+   * @param {string} accountId
+   * @param {number|null} resetAtMs
+   */
+  recordFiveHourReset(accountId, resetAtMs) {
+    try {
+      const reset = this._storableFiveHourReset(resetAtMs);
+      if (!reset) return;
+
+      const state = this.loadState();
+      const account = state.accounts.find(a => a.id === accountId);
+      if (!account) return;
+
+      // A response in flight can carry a stale window end after a newer one
+      // was stored; the store keeps the latest.
+      if (account.five_hour_reset_at >= reset) return;
+
+      account.five_hour_reset_at = reset;
+      this.saveState(state);
+    } catch (error) {
+      Logger.warn(`Failed to record the 5-hour reset: ${error.message}`);
+    }
+  }
+
+  /**
+   * Record a successful auto ping: it started a new window, so the next reset
+   * is the ping's own 5-hour mark unless the response already named one.
+   * A save error is left to throw: the ping did not count.
+   * @param {string} accountId
+   * @param {number|null} fiveHourResetAtMs
+   */
+  recordAutoPingResult(accountId, fiveHourResetAtMs) {
+    const now = Date.now();
+    const reset = this._storableFiveHourReset(fiveHourResetAtMs, now) || (now + FIVE_HOUR_MS);
+
+    const state = this.loadState();
+    const account = state.accounts.find(a => a.id === accountId);
+    if (!account) return;
+
+    account.five_hour_reset_at = Math.max(account.five_hour_reset_at || 0, reset);
+    account.auto_ping_last_at = now;
+    this.saveState(state);
+  }
+
+  /**
+   * Accounts whose 5-hour window has ended, so the next one needs starting.
+   * @param {number} now
+   * @returns {Object[]} full stored accounts
+   */
+  getAutoPingCandidates(now = Date.now()) {
+    return this.loadState().accounts.filter(account => {
+      if (account.disabled) return false;
+      if (!account.access_token || !account.refresh_token) return false;
+      if (this._isLimited(account, now)) return false;
+
+      const fiveHour = Number(account.five_hour_reset_at);
+      const limitEnd = Number(account.limited_until);
+      const lastPing = Number(account.auto_ping_last_at);
+
+      let target;
+      if (Number.isFinite(fiveHour) && fiveHour > 0) target = fiveHour;
+      else if (Number.isFinite(limitEnd) && limitEnd > 0) target = limitEnd;
+      else if (Number.isFinite(lastPing) && lastPing > 0) target = lastPing + FIVE_HOUR_MS;
+      else target = 0; // no window known: establish one on the next tick
+
+      return target + AUTO_PING_GRACE_MS <= now;
+    });
   }
 
   /**

@@ -6,6 +6,7 @@ const path = require('path');
 const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const AutoPing = require('./AutoPing');
 const { redactHeaders } = require('./redact');
 const { exec } = require('child_process');
 
@@ -549,6 +550,12 @@ function startServer() {
       Logger.info('  → Opening browser for authentication...');
       setTimeout(() => openBrowser(authUrl), 1000);
     }
+
+    if (config.auto_ping_enabled !== 'false') {
+      AutoPing.start();
+      Logger.info('  ℹ Auto ping keeps each pooled account\'s 5-hour window open (claude-haiku-4-5); set auto_ping_enabled=false to stop it');
+    }
+
     Logger.info('');
   });
 

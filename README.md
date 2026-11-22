@@ -54,6 +54,8 @@ The proxy now supports **standalone OAuth authentication** - no Claude Code inst
 
 Visiting `/auth/login` again adds another account rather than replacing the one in use. Requests always go to one active account, so the prompt-cache prefix stays stable; when that account answers 429 the proxy marks it limited until its reset and retries the same request on the next account in login order. A limit that expires does not pull traffic back: only a 429 moves the active account. If every account is limited the proxy answers 429 with `Retry-After`.
 
+At each eligible pooled account's 5-hour window reset the proxy sends a one-token `claude-haiku-4-5` request to that account, whether the previous window was used or not, so the next window starts and its countdown appears without waiting for real traffic. Disabled accounts and accounts serving a longer rate limit are skipped. A newly added account with no known window is pinged on the next check, which starts its cycle. Set `auto_ping_enabled=false` in `server/config.txt` to turn it off. This covers pooled OAuth accounts only; the read-only Claude Code fallback is not pinged.
+
 **Manual Authentication:**
 - Visit `http://localhost:42069/auth/login` to authenticate or add an account
 - Manage accounts: `http://localhost:42069/auth/accounts` (activate, disable, or delete one account; a disabled account is skipped even after its limit resets, and `Activate` clears that and makes it the active account)
