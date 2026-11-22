@@ -16,11 +16,13 @@ jest.mock('./Logger', () => ({
 }));
 
 const OAuthManager = require('./OAuthManager');
+const Telegram = require('./Telegram');
 const { handleRequest } = require('./server');
 
 const TEST_DIR = path.join(__dirname, '.test-server-accounts');
 const STATE_PATH = path.join(TEST_DIR, 'accounts.json');
 const TOKEN_PATH = path.join(TEST_DIR, 'tokens.json');
+const TELEGRAM_PATH = path.join(TEST_DIR, 'telegram.json');
 
 const server = () => http.createServer(handleRequest);
 
@@ -66,6 +68,8 @@ beforeEach(() => {
   OAuthManager.statePath = STATE_PATH;
   OAuthManager.tokenPath = TOKEN_PATH;
   OAuthManager.refreshPromises.clear();
+  // The settings routes write beside the account store, never into $HOME.
+  Telegram.settingsPath = TELEGRAM_PATH;
 
   if (fs.existsSync(TEST_DIR)) {
     fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -542,5 +546,108 @@ describe('CORS headers', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers['access-control-allow-origin']).toBe('*');
+  });
+});
+
+describe('telegram settings routes', () => {
+  const save = (body) => request(server()).post('/auth/settings/telegram').send(body);
+  const storedSettings = () => JSON.parse(fs.readFileSync(TELEGRAM_PATH, 'utf8'));
+
+  it('reports nothing configured before the first save', async () => {
+    const response = await request(server()).get('/auth/settings/telegram');
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ chat_id: '', bot_token_set: false, configured: false });
+  });
+
+  it('stores the token and chat id without echoing the token', async () => {
+    const response = await save({ bot_token: '123:abc', chat_id: '-100123' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ chat_id: '-100123', bot_token_set: true, configured: true });
+    expect(storedSettings()).toEqual({ bot_token: '123:abc', chat_id: '-100123' });
+    expect(fs.statSync(TELEGRAM_PATH).mode & 0o777).toBe(0o600);
+  });
+
+  it('keeps the stored token when a later save leaves it out', async () => {
+    await save({ bot_token: '123:abc', chat_id: '-100123' });
+
+    const response = await save({ chat_id: '-100456' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ chat_id: '-100456', bot_token_set: true, configured: true });
+    expect(storedSettings()).toEqual({ bot_token: '123:abc', chat_id: '-100456' });
+  });
+
+  it('turns notifications off when the chat id is emptied', async () => {
+    await save({ bot_token: '123:abc', chat_id: '-100123' });
+
+    const response = await save({ chat_id: '' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ chat_id: '', bot_token_set: true, configured: false });
+    expect(storedSettings().chat_id).toBe('');
+  });
+
+  it('rejects a token with no colon and writes nothing', async () => {
+    const response = await save({ bot_token: 'nocolon', chat_id: '-100123' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'bot_token is not a valid Telegram bot token' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('rejects a non-string token or chat id', async () => {
+    const token = await save({ bot_token: 123, chat_id: '-100123' });
+    expect(token.status).toBe(400);
+    expect(token.body).toEqual({ error: 'bot_token must be a string' });
+
+    const chat = await save({ chat_id: 100123 });
+    expect(chat.status).toBe(400);
+    expect(chat.body).toEqual({ error: 'chat_id must be a string' });
+
+    const missing = await request(server()).post('/auth/settings/telegram').send({});
+    expect(missing.status).toBe(400);
+    expect(missing.body).toEqual({ error: 'chat_id must be a string' });
+  });
+
+  it('rejects whitespace inside a chat id', async () => {
+    const response = await save({ bot_token: '123:abc', chat_id: '-100 123' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'chat_id must not contain whitespace' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('rejects a malformed JSON body', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram')
+      .set('Content-Type', 'application/json')
+      .send('{broken');
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid JSON/);
+  });
+
+  it('rejects a cross-origin save and writes nothing', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram')
+      .set('Origin', 'http://evil.example')
+      .send({ bot_token: '123:abc', chat_id: '-100123' });
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: 'Cross-origin request rejected' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('accepts a same-origin save', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram')
+      .set('Host', 'proxy.test')
+      .set('Origin', 'http://proxy.test')
+      .send({ bot_token: '123:abc', chat_id: '-100123' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.configured).toBe(true);
   });
 });

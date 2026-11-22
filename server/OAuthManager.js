@@ -50,6 +50,18 @@ function accountKey(account) {
   return null;
 }
 
+// When the account's current window ends. The reset the upstream named wins;
+// without one, the limit end, then the ping that opened the window.
+function autoPingTarget(account) {
+  const fiveHour = Number(account.five_hour_reset_at);
+  const limitEnd = Number(account.limited_until);
+  const lastPing = Number(account.auto_ping_last_at);
+  if (Number.isFinite(fiveHour) && fiveHour > 0) return fiveHour;
+  if (Number.isFinite(limitEnd) && limitEnd > 0) return limitEnd;
+  if (Number.isFinite(lastPing) && lastPing > 0) return lastPing + FIVE_HOUR_MS;
+  return 0;
+}
+
 class OAuthManager {
   constructor() {
     const home = process.env.HOME || process.env.USERPROFILE;
@@ -771,18 +783,34 @@ class OAuthManager {
       if (!account.access_token || !account.refresh_token) return false;
       if (this._isLimited(account, now)) return false;
 
-      const fiveHour = Number(account.five_hour_reset_at);
-      const limitEnd = Number(account.limited_until);
-      const lastPing = Number(account.auto_ping_last_at);
-
-      let target;
-      if (Number.isFinite(fiveHour) && fiveHour > 0) target = fiveHour;
-      else if (Number.isFinite(limitEnd) && limitEnd > 0) target = limitEnd;
-      else if (Number.isFinite(lastPing) && lastPing > 0) target = lastPing + FIVE_HOUR_MS;
-      else target = 0; // no window known: establish one on the next tick
-
-      return target + AUTO_PING_GRACE_MS <= now;
+      const target = autoPingTarget(account);
+      return target + AUTO_PING_GRACE_MS <= now; // target 0: establish a window on the next tick
     });
+  }
+
+  /**
+   * When the scheduler will next ping this account, for reporting alongside a
+   * ping result. Same source of truth as getAutoPingCandidates, so the reported
+   * time and the actual next attempt agree.
+   * @param {string} accountId
+   * @param {{retryAt?: number|null, now?: number}} options
+   * @returns {number|null} epoch ms, or null when the account will not be pinged
+   */
+  nextAutoPingAt(accountId, { retryAt = null, now = Date.now() } = {}) {
+    const account = this.loadState().accounts.find(a => a.id === accountId);
+    if (!account) return null;
+    if (account.disabled) return null;
+    if (!account.access_token || !account.refresh_token) return null;
+
+    const target = autoPingTarget(account);
+    let at = target > 0 ? target + AUTO_PING_GRACE_MS : now;
+
+    // A limit that outlasts the window blocks the ping until it clears.
+    const limitEnd = Number(account.limited_until);
+    if (Number.isFinite(limitEnd) && limitEnd > now) at = Math.max(at, limitEnd);
+
+    if (Number.isFinite(retryAt) && retryAt > at) at = retryAt;
+    return at;
   }
 
   /**

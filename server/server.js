@@ -7,6 +7,7 @@ const ClaudeRequest = require('./ClaudeRequest');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const AutoPing = require('./AutoPing');
+const Telegram = require('./Telegram');
 const { redactHeaders } = require('./redact');
 const { exec } = require('child_process');
 
@@ -389,6 +390,70 @@ async function handleRequest(req, res) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Failed to check authentication status' }));
     }
+    return;
+  }
+
+  if (pathname === '/auth/settings/telegram' && req.method === 'GET') {
+    try {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(Telegram.publicSettings()));
+    } catch (error) {
+      Logger.error('Telegram settings read error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to read Telegram settings' }));
+    }
+    return;
+  }
+
+  if (pathname === '/auth/settings/telegram' && req.method === 'POST') {
+    const fail = (statusCode, error) => {
+      res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error }));
+    };
+
+    if (!isSameOrigin(req)) {
+      fail(403, 'Cross-origin request rejected');
+      return;
+    }
+
+    let settings;
+    try {
+      settings = await parseBody(req);
+    } catch (error) {
+      fail(error.statusCode || 400, error.message);
+      return;
+    }
+
+    const { bot_token, chat_id } = settings || {};
+    // An empty chat id is a valid way to switch notifications off; everything
+    // else is checked before it reaches the settings file.
+    if (typeof chat_id !== 'string') {
+      fail(400, 'chat_id must be a string');
+      return;
+    }
+    if (bot_token !== undefined && typeof bot_token !== 'string') {
+      fail(400, 'bot_token must be a string');
+      return;
+    }
+    if (bot_token && bot_token.trim() && !bot_token.trim().includes(':')) {
+      fail(400, 'bot_token is not a valid Telegram bot token');
+      return;
+    }
+    if (chat_id.trim() && /\s/.test(chat_id.trim())) {
+      fail(400, 'chat_id must not contain whitespace');
+      return;
+    }
+
+    try {
+      Telegram.saveSettings({ bot_token, chat_id });
+    } catch (error) {
+      Logger.error('Failed to save Telegram settings:', error.message);
+      fail(500, 'Failed to save Telegram settings');
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(Telegram.publicSettings()));
     return;
   }
 

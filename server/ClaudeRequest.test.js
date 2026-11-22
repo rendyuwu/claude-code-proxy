@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const zlib = require('zlib');
+const { PassThrough } = require('stream');
 const nock = require('nock');
 const request = require('supertest');
 
@@ -49,6 +50,8 @@ jest.mock('./OAuthManager', () => {
 
 const OAuthManager = require('./OAuthManager');
 const ClaudeRequest = require('./ClaudeRequest');
+const Telegram = require('./Telegram');
+const CacheWatch = require('./CacheWatch');
 
 const SONNET = 'claude-sonnet-4-5-20250929';
 const HAIKU = 'claude-haiku-4-5-20251001';
@@ -81,6 +84,10 @@ afterAll(() => {
 beforeEach(() => {
   nock.cleanAll();
   jest.clearAllMocks();
+  // A response with cache usage now notifies Telegram; keep the host's real
+  // settings file and the network out of the unit tests.
+  jest.spyOn(Telegram, 'send').mockResolvedValue(true);
+  CacheWatch.reset();
   OAuthManager.isAuthenticated.mockReturnValue(true);
   OAuthManager.getActiveAccount.mockReturnValue({ id: 'acct-1', label: 'Account 1' });
   OAuthManager.getValidAccessToken.mockResolvedValue('stored-access-token');
@@ -1045,5 +1052,73 @@ describe('GET /v1/models forwarding', () => {
 
     expect(response.status).toBe(200);
     expect(response.body.data[0].id).toBe('claude-opus-5');
+  });
+});
+
+describe('cache usage tap', () => {
+  const chatBody = { model: SONNET, messages: [{ role: 'user', content: 'hi' }] };
+
+  const tap = async (chunks) => {
+    const observe = jest.spyOn(CacheWatch, 'observe').mockReturnValue(null);
+    const stream = new PassThrough();
+    new ClaudeRequest().watchUsage(stream, chatBody);
+
+    const finished = new Promise(resolve => stream.on('end', resolve));
+    for (const chunk of chunks) stream.write(Buffer.from(chunk));
+    stream.end();
+    await finished;
+
+    return observe;
+  };
+
+  it('finds usage when the body is split mid-line and mid-character', async () => {
+    const sse = 'event: message_start\r\n'
+      + 'data: {"type":"message_start","message":{"usage":{"input_tokens":10,'
+      + '"cache_read_input_tokens":0,"cache_creation_input_tokens":900,"output_tokens":1}}}\r\n\r\n'
+      + 'event: content_block_delta\r\n'
+      + 'data: {"type":"content_block_delta","delta":{"text":"héllo 👋"}}\r\n\r\n';
+
+    // Seven bytes at a time cuts through UTF-8 sequences and JSON lines alike.
+    const bytes = Buffer.from(sse, 'utf8');
+    const chunks = [];
+    for (let offset = 0; offset < bytes.length; offset += 7) {
+      chunks.push(bytes.subarray(offset, offset + 7));
+    }
+
+    const observe = await tap(chunks);
+
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe.mock.calls[0][0].usage).toEqual({
+      input_tokens: 10,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 900,
+      output_tokens: 1
+    });
+    expect(observe.mock.calls[0][0].body).toBe(chatBody);
+  });
+
+  it('reports only the first usage event of a stream', async () => {
+    const sse = 'event: message_start\n'
+      + 'data: {"type":"message_start","message":{"usage":{"cache_read_input_tokens":0,"cache_creation_input_tokens":900}}}\n\n'
+      + 'event: message_delta\n'
+      + 'data: {"type":"message_delta","usage":{"cache_read_input_tokens":0,"output_tokens":12}}\n\n';
+
+    const observe = await tap([sse]);
+
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe.mock.calls[0][0].usage.output_tokens).toBeUndefined();
+  });
+
+  it('keeps looking past events that carry no cache accounting', async () => {
+    const sse = 'event: message_start\n'
+      + 'data: {"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}\n\n'
+      + 'data: not json at all\n\n'
+      + 'event: message_delta\n'
+      + 'data: {"type":"message_delta","usage":{"cache_read_input_tokens":0,"output_tokens":12}}\n\n';
+
+    const observe = await tap([sse]);
+
+    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe.mock.calls[0][0].usage.cache_read_input_tokens).toBe(0);
   });
 });

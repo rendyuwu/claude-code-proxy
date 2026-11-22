@@ -112,6 +112,45 @@
       padding: 12px;
       border-radius: 4px;
     }
+    #telegram-settings {
+      margin-top: 32px;
+      padding-top: 24px;
+      border-top: 1px solid #e2e8f0;
+    }
+    #telegram-settings h2 {
+      font-size: 18px;
+      margin: 0 0 8px;
+    }
+    #telegram-settings p {
+      color: #4a5568;
+      line-height: 1.5;
+      margin: 0 0 16px;
+    }
+    #telegram-form {
+      display: grid;
+      grid-template-columns: max-content minmax(0, 320px);
+      align-items: center;
+      gap: 10px 16px;
+    }
+    #telegram-form label {
+      font-size: 13px;
+      color: #4a5568;
+    }
+    #telegram-form input {
+      font: inherit;
+      padding: 8px 10px;
+      border: 1px solid #cbd5e0;
+      border-radius: 4px;
+    }
+    #telegram-form button,
+    #telegram-status {
+      grid-column: 1 / -1;
+      justify-self: start;
+    }
+    #telegram-status {
+      font-size: 13px;
+      color: #718096;
+    }
   </style>
 </head>
 <body>
@@ -138,6 +177,19 @@
       </thead>
       <tbody id="rows"></tbody>
     </table>
+
+    <section id="telegram-settings">
+      <h2>Telegram notifications</h2>
+      <p>One-way messages: each claude-haiku-4-5 auto-ping result with its next ping time (Asia/Jakarta), and every request answered with cache_read_input_tokens = 0.</p>
+      <form id="telegram-form">
+        <label for="telegram-chat-id">Chat ID</label>
+        <input id="telegram-chat-id" name="chat_id" type="text" placeholder="-1001234567890 or @channel">
+        <label for="telegram-bot-token">Bot token</label>
+        <input id="telegram-bot-token" name="bot_token" type="password" autocomplete="off">
+        <button type="submit">Save Telegram settings</button>
+        <span id="telegram-status" role="status"></span>
+      </form>
+    </section>
   </div>
 
   <script>
@@ -146,6 +198,10 @@
     const tableEl = document.getElementById('accounts');
     const rowsEl = document.getElementById('rows');
     const refreshEl = document.getElementById('refresh');
+    const telegramForm = document.getElementById('telegram-form');
+    const telegramChatId = document.getElementById('telegram-chat-id');
+    const telegramToken = document.getElementById('telegram-bot-token');
+    const telegramStatus = document.getElementById('telegram-status');
 
     const resetText = (account) =>
       account.limited_until ? new Date(account.limited_until).toLocaleString() : '—';
@@ -299,8 +355,61 @@
       }
     }
 
+    async function loadTelegram() {
+      try {
+        const response = await fetch('/auth/settings/telegram');
+        const payload = await readJson(response);
+        if (!response.ok) {
+          showError(errorText(response.status, payload));
+          return;
+        }
+        renderTelegram(payload);
+      } catch (error) {
+        showError(error.message || 'Request failed');
+      }
+    }
+
+    function renderTelegram(payload) {
+      telegramChatId.value = (payload && payload.chat_id) || '';
+      telegramToken.placeholder = payload && payload.bot_token_set
+        ? 'Saved — leave blank to keep'
+        : '123456:ABC-DEF...';
+      telegramStatus.textContent = payload && payload.configured
+        ? 'Configured'
+        : 'Not configured — both fields are required';
+    }
+
+    telegramForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      clearError();
+      setBusy(true);
+      try {
+        const body = { chat_id: telegramChatId.value.trim() };
+        if (telegramToken.value.trim()) body.bot_token = telegramToken.value.trim();
+
+        const response = await fetch('/auth/settings/telegram', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const payload = await readJson(response);
+        if (!response.ok) {
+          showError(errorText(response.status, payload));
+          return;
+        }
+        telegramToken.value = '';
+        renderTelegram(payload);
+        telegramStatus.textContent = 'Saved.';
+      } catch (error) {
+        showError(error.message || 'Request failed');
+      } finally {
+        setBusy(false);
+      }
+    });
+
     refreshEl.addEventListener('click', load);
     load();
+    loadTelegram();
   </script>
 </body>
 </html>

@@ -56,6 +56,15 @@ Visiting `/auth/login` again adds another account rather than replacing the one 
 
 At each eligible pooled account's 5-hour window reset the proxy sends a one-token `claude-haiku-4-5` request to that account, whether the previous window was used or not, so the next window starts and its countdown appears without waiting for real traffic. Disabled accounts and accounts serving a longer rate limit are skipped. A newly added account with no known window is pinged on the next check, which starts its cycle. Set `auto_ping_enabled=false` in `server/config.txt` to turn it off. This covers pooled OAuth accounts only; the read-only Claude Code fallback is not pinged.
 
+### Telegram Notifications
+
+Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. Two things are sent:
+
+- every `claude-haiku-4-5` auto-ping result, with its outcome and the next ping time in Asia/Jakarta;
+- every successful response whose `usage.cache_read_input_tokens` is `0`, labelled `new chat`, `no cache hit yet`, or `CACHE BREAK`. A break means the same conversation had a cache hit before, or its cached prompt prefix changed (model, system prompt or opening message).
+
+A conversation is identified by `x-chat-id`, `x-conversation-id` or `x-session-id` when the client sends one, else by `metadata.user_id.session_id`, else by a hash of the opening message. That tracking lives in memory, so a proxy restart makes the next zero read look like a new chat. Delivery is best effort: a failure is logged and dropped, never retried, and never affects the response the client receives.
+
 **Manual Authentication:**
 - Visit `http://localhost:42069/auth/login` to authenticate or add an account
 - Manage accounts: `http://localhost:42069/auth/accounts` (activate, disable, or delete one account; a disabled account is skipped even after its limit resets, and `Activate` clears that and makes it the active account)

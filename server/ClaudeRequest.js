@@ -3,9 +3,11 @@ const zlib = require('zlib');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { StringDecoder } = require('string_decoder');
 const { execSync } = require('child_process');
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
+const CacheWatch = require('./CacheWatch');
 const { redactHeaders } = require('./redact');
 const { applyCloaking, cloakTools, decloakToolNames, isOAuthToken, CLAUDE_CLI_VERSION } = require('./cloaking');
 const SseToolNameRewriter = require('./SseToolNameRewriter');
@@ -130,6 +132,9 @@ class ClaudeRequest {
     // Which pooled account the current attempt is billed to. Set by
     // loadOrRefreshToken; the 429 path uses it to mark the right account.
     this.accountId = null;
+    // Kept for cache diagnostics: a client that names its conversation does so
+    // in a header, which the response path no longer has.
+    this.clientHeaders = req?.headers || {};
     const apiKey = req?.headers?.['x-api-key'];
     if (apiKey && apiKey.includes('sk-ant')) {
       Logger.debug('Using x-api-key as token for this request');
@@ -690,7 +695,7 @@ class ClaudeRequest {
     return this.proxyUpstream(
       res,
       (token) => this.makeRequest(body, presetName, token),
-      { failoverOn429: true }
+      { failoverOn429: true, requestBody: body }
     );
   }
 
@@ -701,7 +706,7 @@ class ClaudeRequest {
   // Single place that owns the 401-retry, 429 failover, header copy and body
   // forwarding for every upstream call. send(token) receives null on the first
   // attempt and re-selects the active account on every later one.
-  async proxyUpstream(res, send, { failoverOn429 = false } = {}) {
+  async proxyUpstream(res, send, { failoverOn429 = false, requestBody = null } = {}) {
     try {
       let claudeResponse = await send(null);
 
@@ -775,7 +780,7 @@ class ClaudeRequest {
       Logger.debug('Claude response headers:', JSON.stringify(claudeResponse.headers, null, 2));
       this.copyResponseHeaders(res, claudeResponse);
 
-      this.streamResponse(res, claudeResponse);
+      this.streamResponse(res, claudeResponse, requestBody);
 
     } catch (error) {
       Logger.error('Claude request error:', error.message);
@@ -831,7 +836,8 @@ class ClaudeRequest {
     return claudeResponse.pipe(createDecoder());
   }
 
-  streamResponse(res, claudeResponse) {
+  streamResponse(res, claudeResponse, requestBody = null) {
+    const successful = claudeResponse.statusCode >= 200 && claudeResponse.statusCode < 300;
     const extractClaudeText = (chunk) => {
       try {
         const lines = chunk.toString().split('\n');
@@ -891,6 +897,10 @@ class ClaudeRequest {
     });
 
     if (contentType.includes('text/event-stream')) {
+      // The tap listens alongside the pipe and never reads from it, so the
+      // bytes handed to the client are exactly the bytes upstream sent.
+      if (successful && requestBody) this.watchUsage(source, requestBody);
+
       Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
 
       if (Logger.getLogLevel() >= 3) {
@@ -917,10 +927,25 @@ class ClaudeRequest {
 
       source.on('end', () => {
         Logger.debug(`Non-streaming response (${claudeResponse.statusCode}): ${responseData.substring(0, 500)}`);
+
+        let parsed = null;
+        try {
+          parsed = JSON.parse(responseData);
+        } catch (e) {
+          // Not JSON: forwarded untouched below, exactly as before.
+        }
+
+        // Recorded before the disconnect guard: the upstream finished, so the
+        // cache event is real even if the client walked away.
+        if (successful && parsed) {
+          CacheWatch.observe({ headers: this.clientHeaders, body: requestBody, usage: parsed.usage });
+        }
+
         if (res.headersSent || res.destroyed) return;
 
         try {
-          const payload = JSON.stringify(decloakToolNames(JSON.parse(responseData), this.toolNameMap));
+          if (!parsed) throw new Error('unparsable response body');
+          const payload = JSON.stringify(decloakToolNames(parsed, this.toolNameMap));
           res.setHeader('Content-Type', 'application/json');
           res.setHeader('Content-Length', Buffer.byteLength(payload));
           Logger.debug('Outgoing response headers to client:', JSON.stringify(res.getHeaders(), null, 2));
@@ -933,6 +958,81 @@ class ClaudeRequest {
         }
       });
     }
+  }
+
+  /**
+   * Read the cache usage out of a streamed response without consuming it. The
+   * client keeps getting every byte: this only listens, and the first event
+   * that carries cache accounting ends the parse.
+   * @param {import('stream').Stream} source
+   * @param {Object} requestBody
+   */
+  watchUsage(source, requestBody) {
+    const decoder = new StringDecoder('utf8');
+    let pending = '';
+    let reported = false;
+
+    const inspect = (line) => {
+      if (reported) return;
+
+      const trimmed = line.endsWith('\r') ? line.slice(0, -1) : line;
+      if (!trimmed.startsWith('data:')) return;
+
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === '[DONE]') return;
+      // The bulk of a stream is text deltas; only usage events are worth a
+      // JSON round trip.
+      if (!payload.includes('"usage"')) return;
+
+      let event;
+      try {
+        event = JSON.parse(payload);
+      } catch (error) {
+        Logger.debug(`Skipped unparsable SSE event: ${error.message}`);
+        return;
+      }
+
+      const usage = event?.usage || event?.message?.usage;
+      if (!usage || typeof usage !== 'object') return;
+      if (!('cache_read_input_tokens' in usage)
+        && !('cache_creation_input_tokens' in usage)) return;
+
+      CacheWatch.observe({ headers: this.clientHeaders, body: requestBody, usage });
+      reported = true;
+    };
+
+    const inspectLines = (text) => {
+      for (const line of text.split('\n')) inspect(line);
+    };
+
+    source.on('data', (chunk) => {
+      // Already reported: the rest of the stream is text deltas that cost
+      // nothing to leave alone.
+      if (reported) return;
+
+      try {
+        pending += decoder.write(chunk);
+
+        const lastBreak = pending.lastIndexOf('\n');
+        if (lastBreak === -1) return;
+
+        const complete = pending.slice(0, lastBreak);
+        pending = pending.slice(lastBreak + 1);
+        inspectLines(complete);
+      } catch (error) {
+        Logger.debug(`Cache usage tap failed: ${error.message}`);
+      }
+    });
+
+    source.on('end', () => {
+      try {
+        pending += decoder.end();
+        if (pending && !reported) inspectLines(pending);
+        pending = '';
+      } catch (error) {
+        Logger.debug(`Cache usage tap failed: ${error.message}`);
+      }
+    });
   }
 }
 

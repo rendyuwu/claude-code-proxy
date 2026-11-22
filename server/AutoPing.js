@@ -1,6 +1,7 @@
 const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const ClaudeRequest = require('./ClaudeRequest');
+const Telegram = require('./Telegram');
 
 // A window reset is not a to-the-second event, so a 30s scan is cheap and
 // well inside the 10s grace the candidate check already allows.
@@ -66,17 +67,44 @@ const AutoPing = {
       for (const account of OAuthManager.getAutoPingCandidates(now)) {
         if (this.retries.get(account.id) > now) continue;
 
+        let outcome;
         try {
-          await this.ping(account);
-          this.retries.delete(account.id);
+          outcome = await this.ping(account);
         } catch (error) {
           Logger.warn(`Auto ping failed for ${account.label}: ${error.message}`);
           this.retries.set(account.id, Date.now() + (error.retryMs || RETRY_INTERVAL_MS));
+          outcome = { ok: false, detail: error.message };
         }
+
+        if (outcome.ok) this.retries.delete(account.id);
+        this.announce(account, outcome);
       }
     } finally {
       this.running = false;
     }
+  },
+
+  /**
+   * One message per ping attempt, fire and forget: the ping itself has already
+   * been recorded and must not wait on Telegram.
+   * @param {Object} account the candidate the tick worked on
+   * @param {{ok: boolean, detail: string}} outcome
+   */
+  announce(account, outcome) {
+    const stored = OAuthManager.loadState().accounts.find(a => a.id === account.id) || account;
+    const nextAt = OAuthManager.nextAutoPingAt(account.id, {
+      retryAt: this.retries.get(account.id) || null
+    });
+
+    const text = [
+      `Auto-ping ${MODEL}: ${outcome.ok ? 'OK' : 'FAILED'}`,
+      `Account: ${stored.label || stored.id}`,
+      `Detail: ${outcome.detail}`,
+      `Next ping: ${Telegram.formatJakarta(nextAt)}`
+    ].join('\n');
+
+    Telegram.send(text).catch(error =>
+      Logger.warn(`Failed to send auto-ping notification: ${error.message}`));
   },
 
   async ping(account) {
@@ -113,13 +141,13 @@ const AutoPing = {
         reason: 'rate_limit'
       });
       Logger.warn(`Auto ping hit a rate limit on ${account.label}`);
-      return;
+      return { ok: false, detail: 'HTTP 429 rate limit' };
     }
 
     if (status >= 200 && status < 300) {
       OAuthManager.recordAutoPingResult(account.id, ClaudeRequest.fiveHourResetAtMs(headers));
       Logger.info(`Auto ping started the next 5-hour window for ${account.label}`);
-      return;
+      return { ok: true, detail: `HTTP ${status}` };
     }
 
     const error = new Error(`auto ping got HTTP ${status}`);

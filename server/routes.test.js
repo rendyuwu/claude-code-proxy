@@ -51,6 +51,8 @@ jest.mock('./OAuthManager', () => ({
 }));
 
 const OAuthManager = require('./OAuthManager');
+const Telegram = require('./Telegram');
+const CacheWatch = require('./CacheWatch');
 const { handleRequest } = require('./server');
 
 const SONNET = 'claude-sonnet-4-5-20250929';
@@ -68,6 +70,14 @@ afterAll(() => {
 beforeEach(() => {
   nock.cleanAll();
   jest.clearAllMocks();
+  // Cache watching is real here; only delivery is stubbed, so the tests never
+  // read the host's settings file or reach api.telegram.org.
+  CacheWatch.reset();
+  jest.spyOn(Telegram, 'send').mockResolvedValue(true);
+});
+
+afterEach(() => {
+  jest.restoreAllMocks();
 });
 
 describe('POST /v1/:preset/messages', () => {
@@ -424,5 +434,117 @@ describe('other routes', () => {
 
     expect(response.status).toBe(404);
     expect(response.body.error).toBe('Not found');
+  });
+});
+
+describe('cache notifications', () => {
+  const chat = { model: SONNET, messages: [{ role: 'user', content: 'hi' }] };
+
+  const sseWithUsage = (usage) => 'event: message_start\n'
+    + `data: ${JSON.stringify({ type: 'message_start', message: { id: 'msg_1', usage } })}\n\n`
+    + 'event: content_block_delta\n'
+    + 'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+    + 'event: message_stop\n'
+    + 'data: {"type":"message_stop"}\n\n';
+
+  const streamUpstream = (body) => nock('https://api.anthropic.com')
+    .post('/v1/messages')
+    .query({ beta: 'true' })
+    .reply(200, body, { 'content-type': 'text/event-stream' });
+
+  it('notifies once for a streamed zero cache read and forwards every byte', async () => {
+    const sse = sseWithUsage({
+      input_tokens: 10,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 900,
+      output_tokens: 3
+    });
+    streamUpstream(sse);
+
+    const response = await request(server()).post('/v1/messages').send(chat);
+
+    expect(response.status).toBe(200);
+    expect(response.text).toBe(sse);
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    expect(Telegram.send.mock.calls[0][0]).toContain('Cache read 0: new chat');
+  });
+
+  it('notifies a cache break when a later turn of the same chat reads nothing', async () => {
+    streamUpstream(sseWithUsage({
+      input_tokens: 10,
+      cache_read_input_tokens: 40000,
+      cache_creation_input_tokens: 0,
+      output_tokens: 3
+    }));
+    streamUpstream(sseWithUsage({
+      input_tokens: 10,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 40000,
+      output_tokens: 3
+    }));
+
+    await request(server()).post('/v1/messages').send(chat);
+    expect(Telegram.send).not.toHaveBeenCalled();
+
+    await request(server()).post('/v1/messages').send(chat);
+
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    expect(Telegram.send.mock.calls[0][0]).toContain('CACHE BREAK');
+    expect(Telegram.send.mock.calls[0][0]).toContain('Previous cache_read: 40000');
+  });
+
+  it('notifies a zero cache read in a non-streaming body', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, JSON.stringify({
+        id: 'msg_1',
+        usage: {
+          input_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 100,
+          output_tokens: 2
+        }
+      }), { 'content-type': 'application/json' });
+
+    const response = await request(server()).post('/v1/messages').send(chat);
+
+    expect(response.status).toBe(200);
+    expect(response.body.id).toBe('msg_1');
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    expect(Telegram.send.mock.calls[0][0]).toContain('Cache read 0: new chat');
+  });
+
+  it('forwards an unparsable body untouched and says nothing', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, 'not json at all', { 'content-type': 'text/plain' });
+
+    const response = await request(server()).post('/v1/messages').send(chat);
+
+    expect(response.status).toBe(200);
+    expect(response.text).toBe('not json at all');
+    expect(Telegram.send).not.toHaveBeenCalled();
+  });
+
+  it('says nothing about a failed response', async () => {
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(500, JSON.stringify({
+        type: 'error',
+        usage: {
+          input_tokens: 5,
+          cache_read_input_tokens: 0,
+          cache_creation_input_tokens: 0,
+          output_tokens: 0
+        }
+      }), { 'content-type': 'application/json' });
+
+    const response = await request(server()).post('/v1/messages').send(chat);
+
+    expect(response.status).toBe(500);
+    expect(Telegram.send).not.toHaveBeenCalled();
   });
 });

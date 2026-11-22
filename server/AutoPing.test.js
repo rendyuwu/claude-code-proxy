@@ -14,6 +14,7 @@ jest.mock('./Logger', () => ({
 
 const OAuthManager = require('./OAuthManager');
 const AutoPing = require('./AutoPing');
+const Telegram = require('./Telegram');
 
 const TEST_DIR = path.join(__dirname, '.test-auto-ping-accounts');
 const STATE_PATH = path.join(TEST_DIR, 'accounts.json');
@@ -70,6 +71,9 @@ beforeEach(() => {
   OAuthManager.tokenPath = TOKEN_PATH;
   OAuthManager.refreshPromises.clear();
   AutoPing.stop();
+  // Every tick now announces its outcome; the tests assert on the text, never
+  // on a real api.telegram.org call.
+  jest.spyOn(Telegram, 'send').mockResolvedValue(true);
 
   if (fs.existsSync(TEST_DIR)) {
     fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -78,6 +82,7 @@ beforeEach(() => {
 
 afterEach(() => {
   AutoPing.stop();
+  jest.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) {
     fs.rmSync(TEST_DIR, { recursive: true, force: true });
   }
@@ -143,6 +148,7 @@ describe('AutoPing', () => {
 
     expect(requests).toHaveLength(0);
     expect(AutoPing.retries.size).toBe(0);
+    expect(Telegram.send).not.toHaveBeenCalled();
   });
 
   it('records a 429 instead of a ping and does not claim the window started', async () => {
@@ -316,5 +322,73 @@ describe('AutoPing', () => {
     await Promise.all([AutoPing.tick(), AutoPing.tick()]);
 
     expect(requests).toHaveLength(1);
+  });
+
+  it('announces a successful ping with the account and the next ping time', async () => {
+    const account = addAccount('a');
+    const fiveHourSec = Math.floor(Date.now() / 1000) + 3600;
+    patchAccount(account.id, { five_hour_reset_at: Date.now() - 60000 });
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(200, JSON.stringify({ id: 'msg_ping' }), {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-5h-reset': String(fiveHourSec)
+      });
+
+    await AutoPing.tick();
+
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    const text = Telegram.send.mock.calls[0][0];
+    expect(text).toContain('Auto-ping claude-haiku-4-5: OK');
+    expect(text).toContain('Account: a@example.com');
+    expect(text).toContain('Detail: HTTP 200');
+    // The window that just started is what the next ping waits for.
+    expect(text).toContain(`Next ping: ${Telegram.formatJakarta((fiveHourSec * 1000) + 10000)}`);
+  });
+
+  it('announces a failed ping with its error and the backoff time', async () => {
+    const account = addAccount('a');
+    patchAccount(account.id, { five_hour_reset_at: Date.now() - 60000 });
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(500, { type: 'error' }, { 'content-type': 'application/json' });
+
+    await AutoPing.tick();
+
+    const retryAt = AutoPing.retries.get(account.id);
+    expect(retryAt).toBeGreaterThan(Date.now());
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    const text = Telegram.send.mock.calls[0][0];
+    expect(text).toContain('Auto-ping claude-haiku-4-5: FAILED');
+    expect(text).toContain('Detail: auto ping got HTTP 500');
+    expect(text).toContain(`Next ping: ${Telegram.formatJakarta(retryAt)}`);
+  });
+
+  it('reports a 429 and waits out the limit when it outlasts the window', async () => {
+    const account = addAccount('a');
+    const resetSec = Math.floor(Date.now() / 1000) + 7200;
+    const fiveHourSec = Math.floor(Date.now() / 1000) + 3600;
+    patchAccount(account.id, { five_hour_reset_at: Date.now() - 60000 });
+
+    nock('https://api.anthropic.com')
+      .post('/v1/messages')
+      .query({ beta: 'true' })
+      .reply(429, { type: 'error', error: { type: 'rate_limit_error', message: 'usage limit' } }, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-reset': String(resetSec),
+        'anthropic-ratelimit-unified-5h-reset': String(fiveHourSec)
+      });
+
+    await AutoPing.tick();
+
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
+    const text = Telegram.send.mock.calls[0][0];
+    expect(text).toContain('Auto-ping claude-haiku-4-5: FAILED');
+    expect(text).toContain('Detail: HTTP 429 rate limit');
+    expect(text).toContain(`Next ping: ${Telegram.formatJakarta(resetSec * 1000)}`);
   });
 });
