@@ -443,6 +443,12 @@ async function handleRequest(req, res) {
       fail(400, 'chat_id must not contain whitespace');
       return;
     }
+    // A numeric id or @channel, optionally with ":<topic>". Anything else would
+    // be rejected by Telegram later, or silently post to the wrong place.
+    if (chat_id.trim() && !/^(?:-?\d+|@\w+)(?::\d+)?$/.test(chat_id.trim())) {
+      fail(400, 'chat_id must be a numeric id or @channel, optionally with :topic');
+      return;
+    }
 
     try {
       Telegram.saveSettings({ bot_token, chat_id });

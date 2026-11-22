@@ -589,6 +589,23 @@ describe('telegram settings routes', () => {
     expect(storedSettings().chat_id).toBe('');
   });
 
+  it('stores a forum topic chat id unchanged', async () => {
+    const response = await save({ bot_token: '123:abc', chat_id: '-100123:534' });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ chat_id: '-100123:534', bot_token_set: true, configured: true });
+    expect(storedSettings().chat_id).toBe('-100123:534');
+  });
+
+  it('rejects a malformed topic suffix instead of posting to the wrong place', async () => {
+    const response = await save({ bot_token: '123:abc', chat_id: '-100123:main' });
+
+    expect(response.status).toBe(400);
+    expect(response.body)
+      .toEqual({ error: 'chat_id must be a numeric id or @channel, optionally with :topic' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
   it('rejects a token with no colon and writes nothing', async () => {
     const response = await save({ bot_token: 'nocolon', chat_id: '-100123' });
 

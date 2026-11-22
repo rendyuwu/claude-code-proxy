@@ -103,6 +103,22 @@ describe('send', () => {
         body.chat_id === '-100123'
         && body.text === 'hello'
         && body.disable_web_page_preview === true
+        && body.message_thread_id === undefined
+      ))
+      .reply(200, { ok: true });
+
+    await expect(Telegram.send('hello')).resolves.toBe(true);
+    expect(scope.isDone()).toBe(true);
+  });
+
+  it('posts the forum topic id when the chat id names one', async () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123:534' });
+
+    const scope = nock('https://api.telegram.org')
+      .post('/bot123:abc/sendMessage', body => (
+        body.chat_id === '-100123'
+        && body.message_thread_id === 534
+        && body.text === 'hello'
       ))
       .reply(200, { ok: true });
 

@@ -28,6 +28,19 @@ const formatter = () => {
 };
 
 /**
+ * A chat id may name a forum topic: the Telegram app shows that chat as
+ * "-1001234567890:534". The Bot API wants the two as separate fields, so the
+ * suffix becomes message_thread_id and the bare id stays chat_id.
+ */
+const splitChatId = (value) => {
+  const [chatId, threadId] = String(value || '').split(':');
+  return {
+    chat_id: chatId,
+    message_thread_id: /^\d+$/.test(threadId) ? Number(threadId) : null
+  };
+};
+
+/**
  * One-way Telegram notifications. Settings live beside the account store, so a
  * Docker volume that survives a restart keeps them, and the file is re-read on
  * every send so a save from the web UI applies without a restart.
@@ -90,7 +103,7 @@ class Telegram {
     return {
       chat_id,
       bot_token_set: Boolean(bot_token),
-      configured: Boolean(bot_token && chat_id)
+      configured: Boolean(bot_token && splitChatId(chat_id).chat_id)
     };
   }
 
@@ -101,11 +114,17 @@ class Telegram {
    * @returns {Promise<boolean>} true when Telegram accepted the message
    */
   send(text) {
-    const { bot_token, chat_id } = this.loadSettings();
+    const { bot_token, chat_id: target } = this.loadSettings();
+    const { chat_id, message_thread_id } = splitChatId(target);
     if (!bot_token || !chat_id) return Promise.resolve(false);
 
     return new Promise(resolve => {
-      const payload = JSON.stringify({ chat_id, text, disable_web_page_preview: true });
+      const payload = JSON.stringify({
+        chat_id,
+        text,
+        disable_web_page_preview: true,
+        ...(message_thread_id === null ? {} : { message_thread_id })
+      });
       let settled = false;
       const finish = (value) => {
         if (settled) return;

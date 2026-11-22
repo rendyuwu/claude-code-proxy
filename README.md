@@ -58,7 +58,7 @@ At each eligible pooled account's 5-hour window reset the proxy sends a one-toke
 
 ### Telegram Notifications
 
-Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. Two things are sent:
+Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. A chat ID may name a forum topic the way the Telegram app shows it, `-1001234567890:534`; the suffix is sent as `message_thread_id`. Two things are sent:
 
 - every `claude-haiku-4-5` auto-ping result, with its outcome and the next ping time in Asia/Jakarta;
 - every successful response whose `usage.cache_read_input_tokens` is `0`, labelled `new chat`, `no cache hit yet`, or `CACHE BREAK`. A break means the same conversation had a cache hit before, or its cached prompt prefix changed (model, system prompt or opening message).
