@@ -149,6 +149,11 @@ class Telegram {
           response.on('data', chunk => { body += chunk; });
           response.on('end', () => {
             if (response.statusCode >= 200 && response.statusCode < 300) {
+              // The token is never part of this line: only where the message went.
+              Logger.info(
+                `Telegram notification sent (chat ${chat_id}`
+                + `${message_thread_id === null ? '' : `, topic ${message_thread_id}`})`
+              );
               finish(true);
               return;
             }

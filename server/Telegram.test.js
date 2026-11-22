@@ -109,6 +109,7 @@ describe('send', () => {
 
     await expect(Telegram.send('hello')).resolves.toBe(true);
     expect(scope.isDone()).toBe(true);
+    expect(Logger.info).toHaveBeenCalledWith('Telegram notification sent (chat -100123)');
   });
 
   it('posts the forum topic id when the chat id names one', async () => {
@@ -124,6 +125,7 @@ describe('send', () => {
 
     await expect(Telegram.send('hello')).resolves.toBe(true);
     expect(scope.isDone()).toBe(true);
+    expect(Logger.info).toHaveBeenCalledWith('Telegram notification sent (chat -100123, topic 534)');
   });
 
   it('resolves false on an HTTP error instead of throwing', async () => {
