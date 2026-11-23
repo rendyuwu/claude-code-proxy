@@ -87,6 +87,7 @@ beforeEach(() => {
   // A response with cache usage now notifies Telegram; keep the host's real
   // settings file and the network out of the unit tests.
   jest.spyOn(Telegram, 'send').mockResolvedValue(true);
+  jest.spyOn(Telegram, 'isModelSilenced').mockReturnValue(false);
   CacheWatch.reset();
   OAuthManager.isAuthenticated.mockReturnValue(true);
   OAuthManager.getActiveAccount.mockReturnValue({ id: 'acct-1', label: 'Account 1' });

@@ -424,7 +424,7 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const { bot_token, chat_id } = settings || {};
+    const { bot_token, chat_id, silent_models } = settings || {};
     // An empty chat id is a valid way to switch notifications off; everything
     // else is checked before it reaches the settings file.
     if (typeof chat_id !== 'string') {
@@ -439,6 +439,12 @@ async function handleRequest(req, res) {
       fail(400, 'bot_token is not a valid Telegram bot token');
       return;
     }
+    if (silent_models !== undefined
+      && (!Array.isArray(silent_models)
+        || silent_models.some(item => typeof item !== 'string'))) {
+      fail(400, 'silent_models must be an array of strings');
+      return;
+    }
     if (chat_id.trim() && /\s/.test(chat_id.trim())) {
       fail(400, 'chat_id must not contain whitespace');
       return;
@@ -451,7 +457,7 @@ async function handleRequest(req, res) {
     }
 
     try {
-      Telegram.saveSettings({ bot_token, chat_id });
+      Telegram.saveSettings({ bot_token, chat_id, silent_models });
     } catch (error) {
       Logger.error('Failed to save Telegram settings:', error.message);
       fail(500, 'Failed to save Telegram settings');

@@ -40,6 +40,15 @@ const splitChatId = (value) => {
   };
 };
 
+const normalizeSilentModels = (value) => (
+  Array.isArray(value)
+    ? [...new Set(value
+        .filter(item => typeof item === 'string')
+        .map(item => item.trim().toLowerCase())
+        .filter(Boolean))]
+    : []
+);
+
 /**
  * One-way Telegram notifications. Settings live beside the account store, so a
  * Docker volume that survives a restart keeps them, and the file is re-read on
@@ -52,34 +61,40 @@ class Telegram {
   }
 
   /**
-   * @returns {{bot_token: string, chat_id: string}} empty strings when unset
+   * @returns {{bot_token: string, chat_id: string, silent_models: string[]}}
+   *   empty strings when unset
    */
   loadSettings() {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.settingsPath, 'utf8'));
       return {
         bot_token: typeof parsed?.bot_token === 'string' ? parsed.bot_token.trim() : '',
-        chat_id: typeof parsed?.chat_id === 'string' ? parsed.chat_id.trim() : ''
+        chat_id: typeof parsed?.chat_id === 'string' ? parsed.chat_id.trim() : '',
+        silent_models: normalizeSilentModels(parsed?.silent_models)
       };
     } catch (error) {
       if (error.code !== 'ENOENT') {
         Logger.warn(`Failed to read Telegram settings: ${error.message}`);
       }
-      return { bot_token: '', chat_id: '' };
+      return { bot_token: '', chat_id: '', silent_models: [] };
     }
   }
 
   /**
    * An empty bot_token keeps the stored one, so the UI can leave the field
    * blank; chat_id is always replaced, and an empty one disables notifications.
-   * @param {{bot_token?: string, chat_id?: string}} settings
-   * @returns {{bot_token: string, chat_id: string}} the stored pair
+   * An omitted silent_models keeps the stored list; [] clears it.
+   * @param {{bot_token?: string, chat_id?: string, silent_models?: string[]}} settings
+   * @returns {{bot_token: string, chat_id: string, silent_models: string[]}} the stored settings
    */
-  saveSettings({ bot_token, chat_id } = {}) {
+  saveSettings({ bot_token, chat_id, silent_models } = {}) {
     const current = this.loadSettings();
     const merged = {
       bot_token: (typeof bot_token === 'string' && bot_token.trim()) || current.bot_token,
-      chat_id: typeof chat_id === 'string' ? chat_id.trim() : ''
+      chat_id: typeof chat_id === 'string' ? chat_id.trim() : '',
+      silent_models: silent_models === undefined
+        ? current.silent_models
+        : normalizeSilentModels(silent_models)
     };
 
     const dir = path.dirname(this.settingsPath);
@@ -99,12 +114,25 @@ class Telegram {
    * What the browser is allowed to see: never the token itself.
    */
   publicSettings() {
-    const { bot_token, chat_id } = this.loadSettings();
+    const { bot_token, chat_id, silent_models } = this.loadSettings();
     return {
       chat_id,
+      silent_models,
       bot_token_set: Boolean(bot_token),
       configured: Boolean(bot_token && splitChatId(chat_id).chat_id)
     };
+  }
+
+  /**
+   * Case-insensitive substring match: "haiku" silences every claude-haiku-* id,
+   * and "claude-sonnet-5-5" also silences dated aliases of that model.
+   * @param {string} model
+   * @returns {boolean}
+   */
+  isModelSilenced(model) {
+    if (typeof model !== 'string' || !model.trim()) return false;
+    const id = model.trim().toLowerCase();
+    return this.loadSettings().silent_models.some(pattern => id.includes(pattern));
   }
 
   /**

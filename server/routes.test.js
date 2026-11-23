@@ -2,6 +2,7 @@
 // than a copy of its logic.
 const http = require('http');
 const fs = require('fs');
+const path = require('path');
 const nock = require('nock');
 const request = require('supertest');
 
@@ -56,6 +57,7 @@ const CacheWatch = require('./CacheWatch');
 const { handleRequest } = require('./server');
 
 const SONNET = 'claude-sonnet-4-5-20250929';
+const TELEGRAM_PATH = path.join(__dirname, '.test-routes-telegram.json');
 const server = () => http.createServer(handleRequest);
 
 beforeAll(() => {
@@ -73,10 +75,13 @@ beforeEach(() => {
   // Cache watching is real here; only delivery is stubbed, so the tests never
   // read the host's settings file or reach api.telegram.org.
   CacheWatch.reset();
+  Telegram.settingsPath = TELEGRAM_PATH;
+  fs.rmSync(TELEGRAM_PATH, { force: true });
   jest.spyOn(Telegram, 'send').mockResolvedValue(true);
 });
 
 afterEach(() => {
+  fs.rmSync(TELEGRAM_PATH, { force: true });
   jest.restoreAllMocks();
 });
 
@@ -467,6 +472,43 @@ describe('cache notifications', () => {
     expect(response.text).toBe(sse);
     expect(Telegram.send).toHaveBeenCalledTimes(1);
     expect(Telegram.send.mock.calls[0][0]).toContain('Cache read 0: new chat');
+  });
+
+  it('silences cache messages for a model listed in the Telegram settings', async () => {
+    const settings = await request(server())
+      .post('/auth/settings/telegram')
+      .send({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+    expect(settings.status).toBe(200);
+    expect(settings.body.silent_models).toEqual(['haiku']);
+
+    const haiku = { model: 'claude-haiku-5-5', messages: [{ role: 'user', content: 'hi' }] };
+    const silencedSse = sseWithUsage({
+      input_tokens: 10,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 900,
+      output_tokens: 3
+    });
+    streamUpstream(silencedSse);
+
+    const silenced = await request(server()).post('/v1/messages').send(haiku);
+
+    expect(silenced.status).toBe(200);
+    expect(silenced.text).toBe(silencedSse);
+    expect(Telegram.send).not.toHaveBeenCalled();
+    expect(CacheWatch.entries.size).toBe(1);
+
+    const sonnet = { model: 'claude-sonnet-5-5', messages: [{ role: 'user', content: 'hi' }] };
+    streamUpstream(sseWithUsage({
+      input_tokens: 10,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 900,
+      output_tokens: 3
+    }));
+
+    const notSilenced = await request(server()).post('/v1/messages').send(sonnet);
+
+    expect(notSilenced.status).toBe(200);
+    expect(Telegram.send).toHaveBeenCalledTimes(1);
   });
 
   it('notifies a cache break when a later turn of the same chat reads nothing', async () => {

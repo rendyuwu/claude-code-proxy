@@ -144,7 +144,7 @@ const CacheWatch = {
       });
       this.prune(at);
 
-      if (cacheRead === 0) {
+      if (cacheRead === 0 && !Telegram.isModelSilenced(model)) {
         const text = describe({
           kind, chatId, model, requestNumber, input, cacheWrite, output,
           previousCacheRead, prefixChanged, at

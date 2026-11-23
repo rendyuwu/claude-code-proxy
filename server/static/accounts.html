@@ -180,12 +180,15 @@
 
     <section id="telegram-settings">
       <h2>Telegram notifications</h2>
-      <p>One-way messages: each claude-haiku-4-5 auto-ping result with its next ping time (Asia/Jakarta), and every request answered with cache_read_input_tokens = 0.</p>
+      <p>One-way messages: each claude-haiku-4-5 auto-ping result with its next ping time (Asia/Jakarta), and every request answered with cache_read_input_tokens = 0 unless its model ID contains an entry in Silent models (case-insensitive).</p>
       <form id="telegram-form">
         <label for="telegram-chat-id">Chat ID</label>
         <input id="telegram-chat-id" name="chat_id" type="text" placeholder="-1001234567890, -1001234567890:534 or @channel">
         <label for="telegram-bot-token">Bot token</label>
         <input id="telegram-bot-token" name="bot_token" type="password" autocomplete="off">
+        <label for="telegram-silent-models">Silent models (cache messages only)</label>
+        <input id="telegram-silent-models" name="silent_models" type="text"
+               placeholder="haiku, claude-sonnet-5-5">
         <button type="submit">Save Telegram settings</button>
         <span id="telegram-status" role="status"></span>
       </form>
@@ -201,6 +204,7 @@
     const telegramForm = document.getElementById('telegram-form');
     const telegramChatId = document.getElementById('telegram-chat-id');
     const telegramToken = document.getElementById('telegram-bot-token');
+    const telegramSilentModels = document.getElementById('telegram-silent-models');
     const telegramStatus = document.getElementById('telegram-status');
 
     const resetText = (account) =>
@@ -371,12 +375,16 @@
 
     function renderTelegram(payload) {
       telegramChatId.value = (payload && payload.chat_id) || '';
+      const silentModels = payload && Array.isArray(payload.silent_models)
+        ? payload.silent_models
+        : [];
+      telegramSilentModels.value = silentModels.join(', ');
       telegramToken.placeholder = payload && payload.bot_token_set
         ? 'Saved — leave blank to keep'
         : '123456:ABC-DEF...';
       telegramStatus.textContent = payload && payload.configured
         ? 'Configured'
-        : 'Not configured — both fields are required';
+        : 'Not configured — chat ID and bot token are required';
     }
 
     telegramForm.addEventListener('submit', async (event) => {
@@ -384,7 +392,11 @@
       clearError();
       setBusy(true);
       try {
-        const body = { chat_id: telegramChatId.value.trim() };
+        const silentModels = telegramSilentModels.value
+          .split(',')
+          .map(item => item.trim())
+          .filter(Boolean);
+        const body = { chat_id: telegramChatId.value.trim(), silent_models: silentModels };
         if (telegramToken.value.trim()) body.bot_token = telegramToken.value.trim();
 
         const response = await fetch('/auth/settings/telegram', {

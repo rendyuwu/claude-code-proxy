@@ -39,9 +39,10 @@ afterEach(() => {
 
 describe('settings', () => {
   it('reports nothing configured before the first save', () => {
-    expect(Telegram.loadSettings()).toEqual({ bot_token: '', chat_id: '' });
+    expect(Telegram.loadSettings()).toEqual({ bot_token: '', chat_id: '', silent_models: [] });
     expect(Telegram.publicSettings()).toEqual({
       chat_id: '',
+      silent_models: [],
       bot_token_set: false,
       configured: false
     });
@@ -50,9 +51,11 @@ describe('settings', () => {
   it('trims both values and never returns the token publicly', () => {
     configure({ bot_token: '  123:abc  ', chat_id: '  -100123  ' });
 
-    expect(Telegram.loadSettings()).toEqual({ bot_token: '123:abc', chat_id: '-100123' });
+    expect(Telegram.loadSettings())
+      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
     expect(Telegram.publicSettings()).toEqual({
       chat_id: '-100123',
+      silent_models: [],
       bot_token_set: true,
       configured: true
     });
@@ -64,15 +67,39 @@ describe('settings', () => {
 
     const merged = Telegram.saveSettings({ chat_id: '-100456' });
 
-    expect(merged).toEqual({ bot_token: '123:abc', chat_id: '-100456' });
+    expect(merged).toEqual({ bot_token: '123:abc', chat_id: '-100456', silent_models: [] });
     expect(Telegram.loadSettings().bot_token).toBe('123:abc');
   });
 
   it('clears the chat id but not the token when the chat id is emptied', () => {
     configure();
 
-    expect(Telegram.saveSettings({ chat_id: '' })).toEqual({ bot_token: '123:abc', chat_id: '' });
+    expect(Telegram.saveSettings({ chat_id: '' }))
+      .toEqual({ bot_token: '123:abc', chat_id: '', silent_models: [] });
     expect(Telegram.publicSettings().configured).toBe(false);
+  });
+
+  it('normalizes silent models to trimmed, unique, lower-case entries', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', silent_models: [' Haiku ', 'HAIKU', ''] });
+
+    expect(Telegram.loadSettings().silent_models).toEqual(['haiku']);
+  });
+
+  it('keeps the stored silent models when a later save omits them', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+
+    const merged = Telegram.saveSettings({ chat_id: '-100456' });
+
+    expect(merged.silent_models).toEqual(['haiku']);
+    expect(Telegram.loadSettings().silent_models).toEqual(['haiku']);
+  });
+
+  it('clears the silent models when an empty array is saved', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+
+    expect(Telegram.saveSettings({ chat_id: '-100123', silent_models: [] }).silent_models)
+      .toEqual([]);
+    expect(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).silent_models).toEqual([]);
   });
 
   it('writes the settings file at mode 0600', () => {
@@ -81,7 +108,7 @@ describe('settings', () => {
     const stats = fs.statSync(SETTINGS_PATH);
 
     expect(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')))
-      .toEqual({ bot_token: '123:abc', chat_id: '-100123' });
+      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
     expect(stats.mode & 0o777).toBe(0o600);
   });
 
@@ -89,8 +116,34 @@ describe('settings', () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
     fs.writeFileSync(SETTINGS_PATH, '{broken', 'utf8');
 
-    expect(Telegram.loadSettings()).toEqual({ bot_token: '', chat_id: '' });
+    expect(Telegram.loadSettings())
+      .toEqual({ bot_token: '', chat_id: '', silent_models: [] });
     expect(Logger.warn).toHaveBeenCalled();
+  });
+});
+
+describe('isModelSilenced', () => {
+  it('matches a model family case-insensitively', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+
+    expect(Telegram.isModelSilenced('claude-haiku-5-5')).toBe(true);
+    expect(Telegram.isModelSilenced('CLAUDE-HAIKU-4-5-20260101')).toBe(true);
+    expect(Telegram.isModelSilenced('claude-sonnet-5-5')).toBe(false);
+  });
+
+  it('matches a dated alias by substring', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['claude-sonnet-5-5'] });
+
+    expect(Telegram.isModelSilenced('claude-sonnet-5-5-20260101')).toBe(true);
+  });
+
+  it('returns false for an empty list or a missing model', () => {
+    configure();
+
+    expect(Telegram.isModelSilenced('claude-haiku-5-5')).toBe(false);
+    expect(Telegram.isModelSilenced('')).toBe(false);
+    expect(Telegram.isModelSilenced(null)).toBe(false);
+    expect(Telegram.isModelSilenced(5)).toBe(false);
   });
 });
 

@@ -61,7 +61,9 @@ At each eligible pooled account's 5-hour window reset the proxy sends a one-toke
 Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. A chat ID may name a forum topic the way the Telegram app shows it, `-1001234567890:534`; the suffix is sent as `message_thread_id`. Two things are sent:
 
 - every `claude-haiku-4-5` auto-ping result, with its outcome and the next ping time in Asia/Jakarta;
-- every successful response whose `usage.cache_read_input_tokens` is `0`, labelled `new chat`, `no cache hit yet`, or `CACHE BREAK`. A break means the same conversation had a cache hit before, or its cached prompt prefix changed (model, system prompt or opening message).
+- every successful response whose `usage.cache_read_input_tokens` is `0`, labelled `new chat`, `no cache hit yet`, or `CACHE BREAK`, unless its model ID contains an entry in the **Silent models** field. A break means the same conversation had a cache hit before, or its cached prompt prefix changed (model, system prompt or opening message).
+
+**Silent models** is a comma-separated list of case-insensitive substrings, e.g. `haiku, claude-sonnet-5-5`; `haiku` covers every current and future Haiku ID. Matching only suppresses the cache message: the conversation is still tracked, so a later break is classified as usual, and auto-ping results are still sent. Leaving the field empty silences nothing.
 
 A conversation is identified by `x-chat-id`, `x-conversation-id` or `x-session-id` when the client sends one, else by `metadata.user_id.session_id`, else by a hash of the opening message. That tracking lives in memory, so a proxy restart makes the next zero read look like a new chat. Delivery is best effort: a failure is logged and dropped, never retried, and never affects the response the client receives.
 

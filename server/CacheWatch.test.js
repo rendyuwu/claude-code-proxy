@@ -23,6 +23,7 @@ const texts = () => Telegram.send.mock.calls.map(([text]) => text);
 beforeEach(() => {
   CacheWatch.reset();
   jest.spyOn(Telegram, 'send').mockResolvedValue(true);
+  jest.spyOn(Telegram, 'isModelSilenced').mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -145,6 +146,29 @@ describe('CacheWatch.observe', () => {
 
     expect(Telegram.send).not.toHaveBeenCalled();
     expect(CacheWatch.entries.size).toBe(0);
+  });
+
+  it('suppresses notifications for a silenced model while still tracking the chat', () => {
+    Telegram.isModelSilenced.mockReturnValue(true);
+
+    const first = CacheWatch.observe({
+      body: body({ model: 'claude-haiku-5-5' }),
+      usage: usage()
+    });
+    CacheWatch.observe({
+      body: body({ model: 'claude-haiku-5-5' }),
+      usage: usage({ cache_read_input_tokens: 40000 })
+    });
+    const broke = CacheWatch.observe({
+      body: body({ model: 'claude-haiku-5-5' }),
+      usage: usage()
+    });
+
+    expect(Telegram.send).not.toHaveBeenCalled();
+    expect(first.kind).toBe('new');
+    expect(broke.kind).toBe('break');
+    expect(broke.requestNumber).toBe(3);
+    expect(CacheWatch.entries.has(broke.chatId)).toBe(true);
   });
 
   it('evicts the least recently seen chat, not the busiest one', () => {

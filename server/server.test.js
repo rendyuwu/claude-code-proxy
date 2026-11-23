@@ -272,6 +272,7 @@ describe('account management routes', () => {
     expect(response.status).toBe(200);
     expect(response.headers['content-type']).toContain('text/html');
     expect(response.text).toContain('OAuth Accounts');
+    expect(response.text).toContain('id="telegram-silent-models"');
   });
 
   it('disables the active account and reports the next one', async () => {
@@ -557,15 +558,22 @@ describe('telegram settings routes', () => {
     const response = await request(server()).get('/auth/settings/telegram');
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ chat_id: '', bot_token_set: false, configured: false });
+    expect(response.body)
+      .toEqual({ chat_id: '', silent_models: [], bot_token_set: false, configured: false });
   });
 
   it('stores the token and chat id without echoing the token', async () => {
     const response = await save({ bot_token: '123:abc', chat_id: '-100123' });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ chat_id: '-100123', bot_token_set: true, configured: true });
-    expect(storedSettings()).toEqual({ bot_token: '123:abc', chat_id: '-100123' });
+    expect(response.body).toEqual({
+      chat_id: '-100123',
+      silent_models: [],
+      bot_token_set: true,
+      configured: true
+    });
+    expect(storedSettings())
+      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
     expect(fs.statSync(TELEGRAM_PATH).mode & 0o777).toBe(0o600);
   });
 
@@ -575,8 +583,14 @@ describe('telegram settings routes', () => {
     const response = await save({ chat_id: '-100456' });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ chat_id: '-100456', bot_token_set: true, configured: true });
-    expect(storedSettings()).toEqual({ bot_token: '123:abc', chat_id: '-100456' });
+    expect(response.body).toEqual({
+      chat_id: '-100456',
+      silent_models: [],
+      bot_token_set: true,
+      configured: true
+    });
+    expect(storedSettings())
+      .toEqual({ bot_token: '123:abc', chat_id: '-100456', silent_models: [] });
   });
 
   it('turns notifications off when the chat id is emptied', async () => {
@@ -585,7 +599,8 @@ describe('telegram settings routes', () => {
     const response = await save({ chat_id: '' });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ chat_id: '', bot_token_set: true, configured: false });
+    expect(response.body)
+      .toEqual({ chat_id: '', silent_models: [], bot_token_set: true, configured: false });
     expect(storedSettings().chat_id).toBe('');
   });
 
@@ -593,7 +608,12 @@ describe('telegram settings routes', () => {
     const response = await save({ bot_token: '123:abc', chat_id: '-100123:534' });
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ chat_id: '-100123:534', bot_token_set: true, configured: true });
+    expect(response.body).toEqual({
+      chat_id: '-100123:534',
+      silent_models: [],
+      bot_token_set: true,
+      configured: true
+    });
     expect(storedSettings().chat_id).toBe('-100123:534');
   });
 
@@ -633,6 +653,62 @@ describe('telegram settings routes', () => {
 
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: 'chat_id must not contain whitespace' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('normalizes silent models and stores them with the settings', async () => {
+    const response = await save({
+      bot_token: '123:abc',
+      chat_id: '-100123',
+      silent_models: [' Haiku ', 'HAIKU', '']
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body.silent_models).toEqual(['haiku']);
+    expect(storedSettings().silent_models).toEqual(['haiku']);
+  });
+
+  it('clears the stored silent models when an empty array is saved', async () => {
+    await save({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+
+    const response = await save({ chat_id: '-100123', silent_models: [] });
+
+    expect(response.status).toBe(200);
+    expect(response.body.silent_models).toEqual([]);
+    expect(storedSettings().silent_models).toEqual([]);
+  });
+
+  it('keeps the stored silent models when a later save omits them', async () => {
+    await save({ bot_token: '123:abc', chat_id: '-100123', silent_models: ['haiku'] });
+
+    const response = await save({ chat_id: '-100456' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.silent_models).toEqual(['haiku']);
+    expect(storedSettings()).toEqual({
+      bot_token: '123:abc',
+      chat_id: '-100456',
+      silent_models: ['haiku']
+    });
+  });
+
+  it('rejects a non-array silent models field and writes nothing', async () => {
+    const response = await save({ bot_token: '123:abc', chat_id: '-100123', silent_models: 'haiku' });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'silent_models must be an array of strings' });
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('rejects an array containing a non-string silent model and writes nothing', async () => {
+    const response = await save({
+      bot_token: '123:abc',
+      chat_id: '-100123',
+      silent_models: ['haiku', 5]
+    });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'silent_models must be an array of strings' });
     expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
   });
 
