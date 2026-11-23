@@ -8,6 +8,9 @@ const Logger = require('./Logger');
 const OAuthManager = require('./OAuthManager');
 const AutoPing = require('./AutoPing');
 const Telegram = require('./Telegram');
+const LimitWatch = require('./LimitWatch');
+const Usage = require('./Usage');
+const { isAllowed, isValidEntry, parseAllowlist } = require('./ipAllowlist');
 const { redactHeaders } = require('./redact');
 const { exec } = require('child_process');
 
@@ -119,14 +122,59 @@ function defaultGateway() {
 
 // Socket address only: x-forwarded-for is client-controlled, so trusting it
 // here would let any remote caller claim to be local.
+function socketAddress(req) {
+  return (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+}
+
 function isLoopback(req) {
-  const ip = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+  const ip = socketAddress(req);
   if (ip === '127.0.0.1' || ip === '::1') return true;
   // A browser on the Docker host is not loopback to the container: the
   // published port arrives from the bridge gateway. That gateway is the host,
   // so the login flow works there; LAN callers keep their own source address
   // and still need the key.
   return isRunningInDocker() && ip === defaultGateway();
+}
+
+// Who may read /limits. That route answers without an API key because the
+// consumer is another local app, so the network is the only thing guarding the
+// per-account usage it exposes.
+//
+// Loopback is the default because that is the use the route exists for. Any
+// wider range — a VPN, a LAN — is a deployment choice, so it belongs in that
+// deployment's own settings (LIMITS_ALLOWLIST in .env, or limits_allowlist in
+// config.txt) rather than baked into the code. An entry that fails to parse is
+// dropped and logged, so a typo narrows access instead of widening it.
+const DEFAULT_LIMITS_ALLOWLIST = '';
+
+// Loopback is added in code rather than left to the setting: "another app on
+// this machine" is the primary use, and an override that forgot 127.0.0.1
+// would break it with no obvious cause. This is the one entry that cannot be
+// configured away.
+const LOOPBACK_ALLOWLIST = ['127.0.0.1/32', '::1/128'];
+
+function limitsAllowlist() {
+  const configured = (process.env.LIMITS_ALLOWLIST || config.limits_allowlist || '').trim();
+  const entries = parseAllowlist(configured);
+  const source = entries.length === 0 ? parseAllowlist(DEFAULT_LIMITS_ALLOWLIST) : entries;
+
+  const valid = source.filter(entry => {
+    if (isValidEntry(entry)) return true;
+    Logger.warn(`Ignoring invalid entry in limits allowlist: ${entry}`);
+    return false;
+  });
+
+  return [...LOOPBACK_ALLOWLIST, ...valid.filter(entry => !LOOPBACK_ALLOWLIST.includes(entry))];
+}
+
+function limitsAllowed(req) {
+  const address = socketAddress(req);
+  if (isAllowed(address, limitsAllowlist())) return true;
+  // In Docker a process on the host reaches the published port from the
+  // bridge gateway, not from 127.0.0.1, so without this an app on the same
+  // machine would be refused. The gateway is the host itself, which is exactly
+  // the "localhost" the route is meant to serve.
+  return isRunningInDocker() && isAllowed(address, [defaultGateway()].filter(Boolean));
 }
 
 // Destructive /auth/* mutations are reachable from any local page if a browser
@@ -287,7 +335,10 @@ async function handleRequest(req, res) {
     // /auth/* is a browser flow that cannot set a header, so it stays reachable
     // from localhost (tunnel in if the port is remote) but never from off-box
     // without the key: /auth/login and /auth/logout both overwrite the tokens.
-    const open = !isAuthRoute && !pathname.startsWith('/v1/');
+    // /limits is guarded by its own network allowlist rather than this key:
+    // the whole point is that another local app can poll it with no setup.
+    const isLimitsRoute = pathname === '/limits';
+    const open = isLimitsRoute || (!isAuthRoute && !pathname.startsWith('/v1/'));
     if (!open && !hasValidKey(req, apiKey) && !(isAuthRoute && isLoopback(req))) {
       Logger.warn(`Rejected ${pathname} from ${clientIP}: missing or wrong API key`);
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -395,12 +446,65 @@ async function handleRequest(req, res) {
 
   if (pathname === '/auth/settings/telegram' && req.method === 'GET') {
     try {
+      const settings = Telegram.publicSettings();
+      // The human wording and the next run come from the same parser the
+      // scheduler uses, so the UI cannot describe a schedule the proxy will
+      // not actually follow.
+      settings.schedule = LimitWatch.describeSchedule(settings.limit_report_cron);
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(Telegram.publicSettings()));
+      res.end(JSON.stringify(settings));
     } catch (error) {
       Logger.error('Telegram settings read error:', error.message);
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Failed to read Telegram settings' }));
+    }
+    return;
+  }
+
+  // Live translation of a cron expression while it is being typed: the field
+  // is useless without a plain-language reading next to it.
+  if (pathname === '/auth/settings/telegram/cron-preview' && req.method === 'GET') {
+    try {
+      const expression = typeof parsedUrl.query.expression === 'string'
+        ? parsedUrl.query.expression
+        : '';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(LimitWatch.describeSchedule(expression)));
+    } catch (error) {
+      Logger.error('Cron preview error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ valid: false, error: 'Failed to read the schedule' }));
+    }
+    return;
+  }
+
+  // "Send now": the same report the cron would deliver, so the schedule can be
+  // saved with a known-good chat id and token.
+  if (pathname === '/auth/settings/telegram/report' && req.method === 'POST') {
+    if (!isSameOrigin(req)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Cross-origin request rejected' }));
+      return;
+    }
+
+    if (!Telegram.publicSettings().configured) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Telegram is not configured' }));
+      return;
+    }
+
+    try {
+      const result = await LimitWatch.sendReport();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        sent: result.sent,
+        failed_accounts: result.failed,
+        preview: result.text
+      }));
+    } catch (error) {
+      Logger.error('Limit report error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to send the limit report' }));
     }
     return;
   }
@@ -424,7 +528,14 @@ async function handleRequest(req, res) {
       return;
     }
 
-    const { bot_token, chat_id, silent_models } = settings || {};
+    const {
+      bot_token,
+      chat_id,
+      silent_models,
+      limit_alerts_enabled,
+      limit_alert_threshold,
+      limit_report_cron
+    } = settings || {};
     // An empty chat id is a valid way to switch notifications off; everything
     // else is checked before it reaches the settings file.
     if (typeof chat_id !== 'string') {
@@ -455,17 +566,51 @@ async function handleRequest(req, res) {
       fail(400, 'chat_id must be a numeric id or @channel, optionally with :topic');
       return;
     }
+    if (limit_alerts_enabled !== undefined && typeof limit_alerts_enabled !== 'boolean') {
+      fail(400, 'limit_alerts_enabled must be a boolean');
+      return;
+    }
+    if (limit_alert_threshold !== undefined
+      && limit_alert_threshold !== null
+      && (!Number.isFinite(Number(limit_alert_threshold))
+        || Number(limit_alert_threshold) <= 0
+        || Number(limit_alert_threshold) > 100)) {
+      fail(400, 'limit_alert_threshold must be a number between 1 and 100');
+      return;
+    }
+    if (limit_report_cron !== undefined && typeof limit_report_cron !== 'string') {
+      fail(400, 'limit_report_cron must be a string');
+      return;
+    }
+    // Reject a bad expression here rather than storing one the scheduler can
+    // only skip: the user would otherwise believe a report is scheduled.
+    if (typeof limit_report_cron === 'string' && limit_report_cron.trim()) {
+      const preview = LimitWatch.describeSchedule(limit_report_cron);
+      if (!preview.valid) {
+        fail(400, `Invalid cron expression: ${preview.error}`);
+        return;
+      }
+    }
 
     try {
-      Telegram.saveSettings({ bot_token, chat_id, silent_models });
+      Telegram.saveSettings({
+        bot_token,
+        chat_id,
+        silent_models,
+        limit_alerts_enabled,
+        limit_alert_threshold,
+        limit_report_cron
+      });
     } catch (error) {
       Logger.error('Failed to save Telegram settings:', error.message);
       fail(500, 'Failed to save Telegram settings');
       return;
     }
 
+    const saved = Telegram.publicSettings();
+    saved.schedule = LimitWatch.describeSchedule(saved.limit_report_cron);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(Telegram.publicSettings()));
+    res.end(JSON.stringify(saved));
     return;
   }
 
@@ -495,6 +640,9 @@ async function handleRequest(req, res) {
   if (pathname === '/auth/logout' && req.method === 'GET') {
     try {
       OAuthManager.logout();
+      // The windows that were already announced belonged to accounts that no
+      // longer exist; a later login must be free to warn again.
+      LimitWatch.reset();
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, message: 'Logged out successfully' }));
       Logger.info('User logged out');
@@ -509,6 +657,84 @@ async function handleRequest(req, res) {
   if (pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', server: 'claude-code-proxy', timestamp: Date.now() }));
+    return;
+  }
+
+  // Read-only JSON of every account's current usage, for another local app to
+  // poll. Deliberately unauthenticated so nothing has to be configured on the
+  // client, which makes the network allowlist the only thing protecting it.
+  if (pathname === '/limits' && req.method === 'GET') {
+    if (!limitsAllowed(req)) {
+      // 403, not 404: the route is not a secret, and a caller outside the
+      // allowlist needs to know why it is being refused to fix its network.
+      Logger.warn(`Rejected /limits from ${clientIP}: address not in the allowlist`);
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        error: 'This address is not allowed to read /limits',
+        allowlist: limitsAllowlist(),
+        hint: 'Set LIMITS_ALLOWLIST or limits_allowlist in config.txt'
+      }));
+      return;
+    }
+
+    try {
+      const now = Date.now();
+      // ?refresh=1 forces a fresh upstream read; the default is the short
+      // cache, so a dashboard polling every second still costs one request a
+      // minute per account.
+      const refresh = /^(1|true|yes)$/i.test(String(parsedUrl.query.refresh || ''));
+      const state = OAuthManager.loadState();
+      const accounts = state.accounts;
+
+      const payloadAccounts = [];
+      for (const account of accounts) {
+        const base = {
+          id: account.id,
+          label: account.label || null,
+          email: account.email ?? null,
+          active: account.id === state.active_account_id,
+          disabled: Boolean(account.disabled)
+        };
+
+        try {
+          const result = await Usage.getAccountUsageCached(account, { now, refresh });
+          payloadAccounts.push({
+            ...base,
+            ok: true,
+            stale: Boolean(result.stale),
+            fetched_at: new Date(result.fetchedAt).toISOString(),
+            ...Usage.snapshotUsage(result.usage, now)
+          });
+        } catch (error) {
+          // One account's upstream failure must not blank the whole response:
+          // the consumer can still show the accounts that did answer.
+          Logger.warn(`/limits could not read usage for ${account.label || account.id}: ${error.message}`);
+          payloadAccounts.push({
+            ...base,
+            ok: false,
+            error: error.message,
+            limits: [],
+            credits: null
+          });
+        }
+      }
+
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        // The upstream cache is here, not in an HTTP cache: a stale copy in a
+        // proxy would outlive the minute the numbers are good for.
+        'Cache-Control': 'no-store'
+      });
+      res.end(JSON.stringify({
+        generated_at: new Date(now).toISOString(),
+        timezone: 'Asia/Jakarta',
+        accounts: payloadAccounts
+      }));
+    } catch (error) {
+      Logger.error('Limits endpoint error:', error.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to read account limits' }));
+    }
     return;
   }
   
@@ -633,16 +859,23 @@ function startServer() {
       Logger.info('  ℹ Auto ping keeps each pooled account\'s 5-hour window open (claude-haiku-4-5); set auto_ping_enabled=false to stop it');
     }
 
+    // Always on: it is a timer that only acts when Telegram is configured for
+    // limits, and the settings are re-read on every tick.
+    LimitWatch.start();
+    Logger.info('  ℹ Limit watch alerts Telegram when a 5-hour or 7-day window reaches its last 10%');
+
     Logger.info('');
   });
 
   process.on('SIGTERM', () => {
     Logger.info('Shutting down...');
+    LimitWatch.stop();
     server.close(() => process.exit(0));
   });
 
   process.on('SIGINT', () => {
     Logger.info('Shutting down...');
+    LimitWatch.stop();
     server.close(() => process.exit(0));
   });
 }

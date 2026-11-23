@@ -58,14 +58,99 @@ At each eligible pooled account's 5-hour window reset the proxy sends a one-toke
 
 ### Telegram Notifications
 
-Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. A chat ID may name a forum topic the way the Telegram app shows it, `-1001234567890:534`; the suffix is sent as `message_thread_id`. Two things are sent:
+Optional, one-way. Set a chat ID and a bot token under "Telegram notifications" at `/auth/accounts`; they are stored in `~/.claude-code-proxy/telegram.json` at mode 0600, so leaving the token field blank keeps the stored one and clearing the chat ID turns notifications off. A chat ID may name a forum topic the way the Telegram app shows it, `-1001234567890:534`; the suffix is sent as `message_thread_id`. Four things are sent:
 
 - every `claude-haiku-4-5` auto-ping result, with its outcome and the next ping time in Asia/Jakarta;
 - every successful response whose `usage.cache_read_input_tokens` is `0`, labelled `new chat`, `no cache hit yet`, or `CACHE BREAK`, unless its model ID contains an entry in the **Silent models** field. A break means the same conversation had a cache hit before, or its cached prompt prefix changed (model, system prompt or opening message).
+- a **low-limit alert** when a pooled account's 5-hour or 7-day window drops to its last 10% (adjustable), so you know which account is about to run out before it does — the alert reads `Limit menipis: … sisa N%` while quota remains and `Limit habis: …` once a window is fully used;
+- a **scheduled limit report** with the current usage of every stored account, on the cron schedule set in the web UI.
 
 **Silent models** is a comma-separated list of case-insensitive substrings, e.g. `haiku, claude-sonnet-5-5`; `haiku` covers every current and future Haiku ID. Matching only suppresses the cache message: the conversation is still tracked, so a later break is classified as usual, and auto-ping results are still sent. Leaving the field empty silences nothing.
 
 A conversation is identified by `x-chat-id`, `x-conversation-id` or `x-session-id` when the client sends one, else by `metadata.user_id.session_id`, else by a hash of the opening message. That tracking lives in memory, so a proxy restart makes the next zero read look like a new chat. Delivery is best effort: a failure is logged and dropped, never retried, and never affects the response the client receives.
+
+#### Limit alerts and reports
+
+Both read `https://api.anthropic.com/api/oauth/usage` per account, which is the same endpoint Claude Code's status line and the reference `limit.sh` use. Every message names the account it belongs to (`Akun: <label> [aktif]`), because the point of the alert is knowing *which* account is about to run out.
+
+**Limit alerts** (`Limit alerts` checkbox, `Alert threshold (% left)` field, default 10) send one message per account per window as soon as the 5-hour or 7-day window is down to its last N%. A window warns once: the upstream reset time is the window's identity, so the same window never repeats and a new window re-arms the alert. Disabled accounts are not polled, and a Telegram delivery failure re-arms the alert for the next poll. Polling happens every 5 minutes; nothing is fetched while Telegram is unconfigured or the alerts are off.
+
+The alert distinguishes the two states, because "running low" and "used up" call for different reactions. While quota remains it reads `Limit menipis: 5 jam sisa 5%`; once a window is fully used the headline becomes `Limit habis: 5 jam`, and a message covering both states names each one (`Limit menipis: 5 jam habis, 7 hari sisa 10%`). A percentage that only rounds down to zero — 99.6% used — still counts as running low rather than exhausted.
+
+**Limit report cron** takes a standard 5-field cronjob expression (`minute hour day-of-month month day-of-week`) or an `@hourly`/`@daily`/`@weekly`/`@monthly`/`@yearly` macro, evaluated in WIB (Asia/Jakarta). The field below the input translates what you typed in plain Indonesian and shows the next run, so a schedule is never saved on a guess; an expression the scheduler could not run is rejected instead of stored. Leave it blank to turn the report off. **Send limit report now** delivers the exact message the cron would, which is the quickest way to prove the chat ID and token work.
+
+Each account's block is the reference script's layout, with the account name added above it:
+
+```
+Sisa limit — 24 Nov 2026, 10:04:05 WIB
+
+Akun: first@example.com [aktif]
+5 jam     ██████████   95% ‼  reset Sel 17:00  (9j 0m)  $1.25/$5  ←
+7 hari    █████░░░░░   46%    reset Sab 08:00  (4h 0j)
+Kredit    ██░░░░░░░░   20%    $2.5 / $10  sisa $7.5
+
+Akun: second@example.com
+5 jam     █░░░░░░░░░    6%    reset Sel 04:00  (3j 25m)
+7 hari    ░░░░░░░░░░    1%    reset Sen 13:00  (6h 12j)
+```
+
+The bar is ten cells of 10% each, `←` marks the window the upstream calls active, `‼`/`⚠` come from its severity, the countdown uses the reference script's `j`/`m`/`h` units, and the credit line appears only when the account reports credit usage. An account whose usage cannot be fetched is still listed, with the failure noted, rather than silently dropped. Long reports are split across several Telegram messages, one whole account block per message.
+
+### JSON endpoint for other apps
+
+`GET /limits` returns every stored account's current usage as plain JSON, for another app on the same machine or inside your VPN to poll. It needs no API key and no extra setup on the client, so **the network is what protects it**: the request's socket address is checked against an allowlist, never `x-forwarded-for`, which any caller can fake.
+
+```
+curl -s http://localhost:42069/limits | jq
+```
+
+```json
+{
+  "generated_at": "2026-11-24T10:04:05.123Z",
+  "timezone": "Asia/Jakarta",
+  "accounts": [
+    {
+      "id": "01e425f8-c0c2-4802-8049-ef64b1226244",
+      "label": "first@example.com",
+      "email": "first@example.com",
+      "active": true,
+      "disabled": false,
+      "ok": true,
+      "stale": false,
+      "fetched_at": "2026-11-24T10:04:04.900Z",
+      "limits": [
+        {
+          "kind": "session",
+          "title": "5 jam",
+          "percent_used": 96,
+          "percent_remaining": 4,
+          "severity": "critical",
+          "exhausted": false,
+          "is_active": true,
+          "resets_at": "2026-11-24T17:00:00.000Z",
+          "resets_in_seconds": 25195,
+          "scope": null
+        }
+      ],
+      "credits": null
+    }
+  ]
+}
+```
+
+Fields worth knowing: `percent_used` and `percent_remaining` are numbers (not pre-formatted strings), `percent_remaining` keeps fractions instead of rounding a real 0.4% down to nothing, `exhausted` is true only when upstream reports the window fully used, `resets_at` is ISO-8601 UTC and `resets_in_seconds` is a convenience countdown, and `credits` is `null` unless the account reports credit spending. Tokens are never included.
+
+Every stored account appears even when its upstream call fails; that entry then has `"ok": false` and an `error` string, so one broken account does not blank the response. `stale: true` means the upstream call failed and the last good snapshot is being served.
+
+Responses are cached in-process for 60 seconds, so a dashboard polling every second still costs one upstream request a minute per account; concurrent polls share a single in-flight request. Add `?refresh=1` to force a fresh read.
+
+**Who can reach it.** The default is loopback only: `127.0.0.1` and `::1` are always allowed and cannot be configured away, because an app on this machine is the case the route exists for. Anything wider — a VPN, a LAN — is a deployment choice, so set it in your own settings rather than expecting a range to be baked in:
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LIMITS_ALLOWLIST` env (e.g. in `.env`), or `limits_allowlist` in `server/config.txt` | empty (loopback only) | Comma-separated IPv4/IPv6 addresses or CIDR ranges allowed to read `/limits`, e.g. `10.8.0.0/24` |
+
+An entry that fails to parse is ignored and logged, so a typo narrows access instead of widening it. A caller outside the list gets `403` with the effective allowlist in the body, which is the quickest way to see what the running server actually allows. Under Docker, requests from the host arrive from the bridge gateway instead of `127.0.0.1`, and that address is allowed too, so an app on the host keeps working without any setting; `docker-compose.yml` passes `LIMITS_ALLOWLIST` through from `.env` for when you do want a range.
 
 **Manual Authentication:**
 - Visit `http://localhost:42069/auth/login` to authenticate or add an account
@@ -211,6 +296,7 @@ Most likely thing to go wrong is not being able to find the credentials, either 
 ### Authentication
 - **OAuth Flow**: Implements PKCE OAuth 2.0 flow to authenticate directly with claude.ai
 - **Token Management**: Keeps a pool of OAuth accounts in `~/.claude-code-proxy/accounts.json`, refreshes their tokens when they expire, and fails a rate-limited request over to the next account
+- **Usage Monitoring**: Polls `/api/oauth/usage` per account to warn on Telegram when a 5-hour or 7-day window is nearly exhausted, and to send a scheduled usage report on a cron schedule you set in the web UI (see [Limit alerts and reports](#limit-alerts-and-reports))
 - **Fallback Support**: Can optionally read Claude Code credentials as a fallback, without ever writing to that file
 
 ### Request Processing

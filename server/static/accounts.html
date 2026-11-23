@@ -142,14 +142,70 @@
       border: 1px solid #cbd5e0;
       border-radius: 4px;
     }
+    #telegram-form input[type="checkbox"] {
+      justify-self: start;
+      width: 16px;
+      height: 16px;
+      padding: 0;
+    }
     #telegram-form button,
-    #telegram-status {
+    #telegram-status,
+    .cron-hint,
+    .field-note {
       grid-column: 1 / -1;
       justify-self: start;
     }
     #telegram-status {
       font-size: 13px;
       color: #718096;
+    }
+    .cron-hint,
+    .field-note {
+      font-size: 13px;
+      line-height: 1.45;
+      color: #4a5568;
+      margin-top: -4px;
+      max-width: 640px;
+    }
+    .cron-hint {
+      background-color: #f7fafc;
+      border-left: 3px solid #1890ff;
+      padding: 8px 10px;
+      border-radius: 0 4px 4px 0;
+    }
+    .cron-hint.invalid {
+      background-color: #fff1f0;
+      border-left-color: #c0392b;
+      color: #c0392b;
+    }
+    .cron-hint code {
+      background-color: #edf2f7;
+      border-radius: 3px;
+      padding: 1px 4px;
+      font-size: 12px;
+    }
+    .cron-examples {
+      grid-column: 1 / -1;
+      justify-self: start;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      color: #718096;
+      font-size: 12px;
+    }
+    .cron-examples button {
+      font-size: 12px;
+      padding: 3px 8px;
+      background-color: #eef2f7;
+      color: #2d3748;
+    }
+    .cron-examples button:hover:enabled {
+      background-color: #dde5ee;
+    }
+    .actions-row {
+      display: flex;
+      gap: 10px;
+      grid-column: 1 / -1;
     }
   </style>
 </head>
@@ -180,7 +236,7 @@
 
     <section id="telegram-settings">
       <h2>Telegram notifications</h2>
-      <p>One-way messages: each claude-haiku-4-5 auto-ping result with its next ping time (Asia/Jakarta), and every request answered with cache_read_input_tokens = 0 unless its model ID contains an entry in Silent models (case-insensitive).</p>
+      <p>One-way messages: each claude-haiku-4-5 auto-ping result with its next ping time (Asia/Jakarta), every request answered with cache_read_input_tokens = 0 unless its model ID contains an entry in Silent models (case-insensitive), a warning when an account's 5-hour or 7-day limit is down to its last few percent, and a scheduled limit report.</p>
       <form id="telegram-form">
         <label for="telegram-chat-id">Chat ID</label>
         <input id="telegram-chat-id" name="chat_id" type="text" placeholder="-1001234567890, -1001234567890:534 or @channel">
@@ -189,7 +245,38 @@
         <label for="telegram-silent-models">Silent models (cache messages only)</label>
         <input id="telegram-silent-models" name="silent_models" type="text"
                placeholder="haiku, claude-sonnet-5-5">
-        <button type="submit">Save Telegram settings</button>
+
+        <label for="limit-alerts-enabled">Limit alerts</label>
+        <input id="limit-alerts-enabled" name="limit_alerts_enabled" type="checkbox" checked>
+        <span class="field-note" id="limit-alerts-note">
+          Send one message per account and window as soon as the 5-hour or 7-day limit reaches its last 10%. Each
+          window warns once; a new window re-arms it. Every message names the account it belongs to.
+        </span>
+
+        <label for="limit-alert-threshold">Alert threshold (% left)</label>
+        <input id="limit-alert-threshold" name="limit_alert_threshold" type="number"
+               min="1" max="100" step="1" value="10">
+
+        <label for="limit-report-cron">Limit report cron</label>
+        <input id="limit-report-cron" name="limit_report_cron" type="text"
+               placeholder="0 8 * * * (leave blank to turn the report off)" autocomplete="off">
+        <div class="cron-hint" id="cron-hint" role="status" aria-live="polite">
+          Format: <code>menit jam tanggal bulan hari</code> — standard 5-field cronjob, evaluated in WIB (Asia/Jakarta).
+          5 fields plus an <code>@daily</code>/<code>@hourly</code> macro are accepted.
+          Examples: <code>0 8 * * *</code> every day 08:00, <code>0 */6 * * *</code> every 6 hours,
+          <code>30 7 * * 1-5</code> weekdays 07:30.
+        </div>
+        <div class="cron-examples" id="cron-examples">
+          <button type="button" data-cron="0 8 * * *">0 8 * * * (daily 08:00)</button>
+          <button type="button" data-cron="0 */6 * * *">0 */6 * * * (every 6h)</button>
+          <button type="button" data-cron="0 21 * * 1-5">0 21 * * 1-5 (weekdays 21:00)</button>
+          <button type="button" data-cron="">Off</button>
+        </div>
+
+        <div class="actions-row">
+          <button type="submit">Save Telegram settings</button>
+          <button type="button" class="secondary" id="report-now">Send limit report now</button>
+        </div>
         <span id="telegram-status" role="status"></span>
       </form>
     </section>
@@ -206,6 +293,12 @@
     const telegramToken = document.getElementById('telegram-bot-token');
     const telegramSilentModels = document.getElementById('telegram-silent-models');
     const telegramStatus = document.getElementById('telegram-status');
+    const limitAlertsEnabled = document.getElementById('limit-alerts-enabled');
+    const limitAlertThreshold = document.getElementById('limit-alert-threshold');
+    const limitReportCron = document.getElementById('limit-report-cron');
+    const cronHint = document.getElementById('cron-hint');
+    const cronExamples = document.getElementById('cron-examples');
+    const reportNow = document.getElementById('report-now');
 
     const resetText = (account) =>
       account.limited_until ? new Date(account.limited_until).toLocaleString() : '—';
@@ -373,19 +466,110 @@
       }
     }
 
+    // Defaults shown before the first save, so the field is never blank with
+    // no explanation of what the numbers mean.
+    const DEFAULT_THRESHOLD = 10;
+
     function renderTelegram(payload) {
       telegramChatId.value = (payload && payload.chat_id) || '';
       const silentModels = payload && Array.isArray(payload.silent_models)
         ? payload.silent_models
         : [];
       telegramSilentModels.value = silentModels.join(', ');
+      limitAlertsEnabled.checked = !(payload && payload.limit_alerts_enabled === false);
+      limitAlertThreshold.value = payload && Number.isFinite(payload.limit_alert_threshold)
+        ? payload.limit_alert_threshold
+        : DEFAULT_THRESHOLD;
+      limitReportCron.value = translateMacrosIn(payload && payload.limit_report_cron) || '';
       telegramToken.placeholder = payload && payload.bot_token_set
         ? 'Saved — leave blank to keep'
         : '123456:ABC-DEF...';
       telegramStatus.textContent = payload && payload.configured
         ? 'Configured'
         : 'Not configured — chat ID and bot token are required';
+      renderSchedule(payload && payload.schedule);
     }
+
+    // The backend accepts @daily and friends; show them expanded so the field
+    // always reads as a normal 5-field cron the moment it is loaded.
+    const MACROS = {
+      '@yearly': '0 0 1 1 *',
+      '@annually': '0 0 1 1 *',
+      '@monthly': '0 0 1 * *',
+      '@weekly': '0 0 * * 0',
+      '@daily': '0 0 * * *',
+      '@midnight': '0 0 * * *',
+      '@hourly': '0 * * * *'
+    };
+
+    function translateMacrosIn(expression) {
+      const trimmed = (expression || '').trim();
+      return MACROS[trimmed.toLowerCase()] || trimmed;
+    }
+
+    // The request counter means only the newest preview can write the hint:
+    // typing quickly used to let an older response overwrite a newer one.
+    let cronPreviewSeq = 0;
+
+    function renderSchedule(schedule) {
+      if (!schedule) {
+        cronHint.classList.remove('invalid');
+        return;
+      }
+      renderScheduleText(schedule);
+    }
+
+    function renderScheduleText(schedule) {
+      if (!schedule.valid) {
+        cronHint.classList.add('invalid');
+        cronHint.textContent = `Invalid cron: ${schedule.error}`;
+        return;
+      }
+      cronHint.classList.remove('invalid');
+      if (!schedule.description) {
+        cronHint.innerHTML = EMPTY_SCHEDULE_HELP;
+        return;
+      }
+      const next = schedule.next_run ? ` · berikutnya ${schedule.next_run}` : '';
+      cronHint.textContent = `Terbaca: ${schedule.description} (WIB)${next}`;
+    }
+
+    const EMPTY_SCHEDULE_HELP = cronHint.innerHTML;
+
+    async function previewCron() {
+      const expression = limitReportCron.value.trim();
+      const sequence = ++cronPreviewSeq;
+      if (!expression) {
+        cronHint.classList.remove('invalid');
+        cronHint.innerHTML = EMPTY_SCHEDULE_HELP;
+        return;
+      }
+      try {
+        const response = await fetch(
+          `/auth/settings/telegram/cron-preview?expression=${encodeURIComponent(expression)}`
+        );
+        const payload = await readJson(response);
+        if (sequence !== cronPreviewSeq || !response.ok) return;
+        renderScheduleText(payload || { valid: false, error: 'unreadable response' });
+      } catch (error) {
+        if (sequence !== cronPreviewSeq) return;
+        cronHint.classList.add('invalid');
+        cronHint.textContent = `Invalid cron: ${error.message}`;
+      }
+    }
+
+    let cronPreviewTimer = null;
+    limitReportCron.addEventListener('input', () => {
+      clearTimeout(cronPreviewTimer);
+      cronPreviewTimer = setTimeout(previewCron, 250);
+    });
+
+    cronExamples.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-cron]');
+      if (!button) return;
+      limitReportCron.value = button.dataset.cron;
+      previewCron();
+    });
 
     telegramForm.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -396,7 +580,14 @@
           .split(',')
           .map(item => item.trim())
           .filter(Boolean);
-        const body = { chat_id: telegramChatId.value.trim(), silent_models: silentModels };
+        const threshold = Number(limitAlertThreshold.value);
+        const body = {
+          chat_id: telegramChatId.value.trim(),
+          silent_models: silentModels,
+          limit_alerts_enabled: limitAlertsEnabled.checked,
+          limit_report_cron: limitReportCron.value.trim()
+        };
+        if (Number.isFinite(threshold)) body.limit_alert_threshold = threshold;
         if (telegramToken.value.trim()) body.bot_token = telegramToken.value.trim();
 
         const response = await fetch('/auth/settings/telegram', {
@@ -416,6 +607,31 @@
         showError(error.message || 'Request failed');
       } finally {
         setBusy(false);
+      }
+    });
+
+    // Sends the same report the cron would, so a chat id and token can be
+    // proven before a schedule depends on them.
+    reportNow.addEventListener('click', async () => {
+      clearError();
+      reportNow.disabled = true;
+      telegramStatus.textContent = 'Sending limit report…';
+      try {
+        const response = await fetch('/auth/settings/telegram/report', { method: 'POST' });
+        const payload = await readJson(response);
+        if (!response.ok) {
+          telegramStatus.textContent = '';
+          showError(errorText(response.status, payload));
+          return;
+        }
+        telegramStatus.textContent = payload && payload.sent
+          ? 'Limit report sent.'
+          : 'Report built but Telegram rejected it — check chat ID and bot token.';
+      } catch (error) {
+        telegramStatus.textContent = '';
+        showError(error.message || 'Request failed');
+      } finally {
+        reportNow.disabled = false;
       }
     });
 

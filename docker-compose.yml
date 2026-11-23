@@ -21,6 +21,11 @@ services:
       - PROXY_API_KEY=${PROXY_API_KEY:-}
       # AUTH_ROUTES_ENABLED=false stops /auth/* being served at all.
       - AUTH_ROUTES_ENABLED=${AUTH_ROUTES_ENABLED:-}
+      # Who may read the unauthenticated GET /limits JSON, e.g. a VPN range.
+      # Blank means loopback only, which is the default: the host reaches the
+      # port from the bridge gateway and the route already allows that, so an
+      # app on the host works without setting anything.
+      - LIMITS_ALLOWLIST=${LIMITS_ALLOWLIST:-}
     logging:
       driver: json-file
       options:

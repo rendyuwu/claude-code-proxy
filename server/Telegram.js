@@ -27,6 +27,9 @@ const formatter = () => {
   return jakartaFormatter;
 };
 
+// Remaining percentage at which a limit counts as "about to run out".
+const DEFAULT_ALERT_THRESHOLD = 10;
+
 /**
  * A chat id may name a forum topic: the Telegram app shows that chat as
  * "-1001234567890:534". The Bot API wants the two as separate fields, so the
@@ -61,40 +64,76 @@ class Telegram {
   }
 
   /**
-   * @returns {{bot_token: string, chat_id: string, silent_models: string[]}}
-   *   empty strings when unset
+   * @returns {{bot_token: string, chat_id: string, silent_models: string[],
+   *   limit_alerts_enabled: boolean, limit_alert_threshold: number,
+   *   limit_report_cron: string}} empty strings/false when unset
    */
   loadSettings() {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.settingsPath, 'utf8'));
+      const threshold = Number(parsed?.limit_alert_threshold);
       return {
         bot_token: typeof parsed?.bot_token === 'string' ? parsed.bot_token.trim() : '',
         chat_id: typeof parsed?.chat_id === 'string' ? parsed.chat_id.trim() : '',
-        silent_models: normalizeSilentModels(parsed?.silent_models)
+        silent_models: normalizeSilentModels(parsed?.silent_models),
+        limit_alerts_enabled: parsed?.limit_alerts_enabled !== false,
+        limit_alert_threshold: Number.isFinite(threshold) && threshold > 0 && threshold <= 100
+          ? threshold
+          : DEFAULT_ALERT_THRESHOLD,
+        limit_report_cron: typeof parsed?.limit_report_cron === 'string'
+          ? parsed.limit_report_cron.trim()
+          : ''
       };
     } catch (error) {
       if (error.code !== 'ENOENT') {
         Logger.warn(`Failed to read Telegram settings: ${error.message}`);
       }
-      return { bot_token: '', chat_id: '', silent_models: [] };
+      return {
+        bot_token: '',
+        chat_id: '',
+        silent_models: [],
+        limit_alerts_enabled: true,
+        limit_alert_threshold: DEFAULT_ALERT_THRESHOLD,
+        limit_report_cron: ''
+      };
     }
   }
 
   /**
    * An empty bot_token keeps the stored one, so the UI can leave the field
    * blank; chat_id is always replaced, and an empty one disables notifications.
-   * An omitted silent_models keeps the stored list; [] clears it.
-   * @param {{bot_token?: string, chat_id?: string, silent_models?: string[]}} settings
-   * @returns {{bot_token: string, chat_id: string, silent_models: string[]}} the stored settings
+   * An omitted silent_models keeps the stored list; [] clears it. Same rule for
+   * the limit fields: omitted keeps, empty disables/clears.
+   * @param {{bot_token?: string, chat_id?: string, silent_models?: string[],
+   *   limit_alerts_enabled?: boolean, limit_alert_threshold?: number,
+   *   limit_report_cron?: string}} settings
+   * @returns {Object} the stored settings
    */
-  saveSettings({ bot_token, chat_id, silent_models } = {}) {
+  saveSettings({
+    bot_token,
+    chat_id,
+    silent_models,
+    limit_alerts_enabled,
+    limit_alert_threshold,
+    limit_report_cron
+  } = {}) {
     const current = this.loadSettings();
+    const threshold = Number(limit_alert_threshold);
     const merged = {
       bot_token: (typeof bot_token === 'string' && bot_token.trim()) || current.bot_token,
       chat_id: typeof chat_id === 'string' ? chat_id.trim() : '',
       silent_models: silent_models === undefined
         ? current.silent_models
-        : normalizeSilentModels(silent_models)
+        : normalizeSilentModels(silent_models),
+      limit_alerts_enabled: typeof limit_alerts_enabled === 'boolean'
+        ? limit_alerts_enabled
+        : current.limit_alerts_enabled,
+      limit_alert_threshold: Number.isFinite(threshold) && threshold > 0 && threshold <= 100
+        ? threshold
+        : current.limit_alert_threshold,
+      limit_report_cron: typeof limit_report_cron === 'string'
+        ? limit_report_cron.trim()
+        : current.limit_report_cron
     };
 
     const dir = path.dirname(this.settingsPath);
@@ -114,10 +153,20 @@ class Telegram {
    * What the browser is allowed to see: never the token itself.
    */
   publicSettings() {
-    const { bot_token, chat_id, silent_models } = this.loadSettings();
+    const {
+      bot_token,
+      chat_id,
+      silent_models,
+      limit_alerts_enabled,
+      limit_alert_threshold,
+      limit_report_cron
+    } = this.loadSettings();
     return {
       chat_id,
       silent_models,
+      limit_alerts_enabled,
+      limit_alert_threshold,
+      limit_report_cron,
       bot_token_set: Boolean(bot_token),
       configured: Boolean(bot_token && splitChatId(chat_id).chat_id)
     };

@@ -17,6 +17,17 @@ const Telegram = require('./Telegram');
 const TEST_DIR = path.join(__dirname, '.test-telegram');
 const SETTINGS_PATH = path.join(TEST_DIR, 'telegram.json');
 
+// The shape of an unset settings file: the limit fields are shown in the UI
+// before anything is saved, so they always have a value.
+const DEFAULTS = {
+  bot_token: '',
+  chat_id: '',
+  silent_models: [],
+  limit_alerts_enabled: true,
+  limit_alert_threshold: 10,
+  limit_report_cron: ''
+};
+
 const configure = (settings = { bot_token: '123:abc', chat_id: '-100123' }) =>
   Telegram.saveSettings(settings);
 
@@ -39,10 +50,13 @@ afterEach(() => {
 
 describe('settings', () => {
   it('reports nothing configured before the first save', () => {
-    expect(Telegram.loadSettings()).toEqual({ bot_token: '', chat_id: '', silent_models: [] });
+    expect(Telegram.loadSettings()).toEqual(DEFAULTS);
     expect(Telegram.publicSettings()).toEqual({
       chat_id: '',
       silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
       bot_token_set: false,
       configured: false
     });
@@ -52,10 +66,13 @@ describe('settings', () => {
     configure({ bot_token: '  123:abc  ', chat_id: '  -100123  ' });
 
     expect(Telegram.loadSettings())
-      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
+      .toEqual({ ...DEFAULTS, bot_token: '123:abc', chat_id: '-100123' });
     expect(Telegram.publicSettings()).toEqual({
       chat_id: '-100123',
       silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
       bot_token_set: true,
       configured: true
     });
@@ -67,7 +84,7 @@ describe('settings', () => {
 
     const merged = Telegram.saveSettings({ chat_id: '-100456' });
 
-    expect(merged).toEqual({ bot_token: '123:abc', chat_id: '-100456', silent_models: [] });
+    expect(merged).toEqual({ ...DEFAULTS, bot_token: '123:abc', chat_id: '-100456' });
     expect(Telegram.loadSettings().bot_token).toBe('123:abc');
   });
 
@@ -75,7 +92,7 @@ describe('settings', () => {
     configure();
 
     expect(Telegram.saveSettings({ chat_id: '' }))
-      .toEqual({ bot_token: '123:abc', chat_id: '', silent_models: [] });
+      .toEqual({ ...DEFAULTS, bot_token: '123:abc', chat_id: '' });
     expect(Telegram.publicSettings().configured).toBe(false);
   });
 
@@ -102,13 +119,53 @@ describe('settings', () => {
     expect(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')).silent_models).toEqual([]);
   });
 
+  it('defaults the limit fields and keeps them around a normal save', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123', limit_alert_threshold: 15 });
+
+    expect(Telegram.loadSettings()).toMatchObject({
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 15,
+      limit_report_cron: ''
+    });
+
+    const merged = Telegram.saveSettings({ chat_id: '-100123' });
+
+    expect(merged.limit_alerts_enabled).toBe(true);
+    expect(merged.limit_alert_threshold).toBe(15);
+  });
+
+  it('turns limit alerts off and stores a cron expression', () => {
+    const merged = Telegram.saveSettings({
+      bot_token: '123:abc',
+      chat_id: '-100123',
+      limit_alerts_enabled: false,
+      limit_report_cron: '0 8 * * *'
+    });
+
+    expect(merged.limit_alerts_enabled).toBe(false);
+    expect(merged.limit_report_cron).toBe('0 8 * * *');
+    expect(Telegram.publicSettings()).toMatchObject({
+      limit_alerts_enabled: false,
+      limit_report_cron: '0 8 * * *'
+    });
+  });
+
+  it('ignores an out-of-range threshold rather than storing it', () => {
+    configure({ bot_token: '123:abc', chat_id: '-100123' });
+
+    expect(Telegram.saveSettings({ chat_id: '-100123', limit_alert_threshold: 0 })
+      .limit_alert_threshold).toBe(10);
+    expect(Telegram.saveSettings({ chat_id: '-100123', limit_alert_threshold: 500 })
+      .limit_alert_threshold).toBe(10);
+  });
+
   it('writes the settings file at mode 0600', () => {
     configure();
 
     const stats = fs.statSync(SETTINGS_PATH);
 
     expect(JSON.parse(fs.readFileSync(SETTINGS_PATH, 'utf8')))
-      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
+      .toEqual({ ...DEFAULTS, bot_token: '123:abc', chat_id: '-100123' });
     expect(stats.mode & 0o777).toBe(0o600);
   });
 
@@ -116,8 +173,7 @@ describe('settings', () => {
     fs.mkdirSync(TEST_DIR, { recursive: true });
     fs.writeFileSync(SETTINGS_PATH, '{broken', 'utf8');
 
-    expect(Telegram.loadSettings())
-      .toEqual({ bot_token: '', chat_id: '', silent_models: [] });
+    expect(Telegram.loadSettings()).toEqual(DEFAULTS);
     expect(Logger.warn).toHaveBeenCalled();
   });
 });

@@ -1,6 +1,7 @@
 // Route-level tests that drive the real handleRequest with the real
 // OAuthManager, pointed at a temporary account store.
 const http = require('http');
+const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const nock = require('nock');
@@ -17,12 +18,22 @@ jest.mock('./Logger', () => ({
 
 const OAuthManager = require('./OAuthManager');
 const Telegram = require('./Telegram');
+const Usage = require('./Usage');
 const { handleRequest } = require('./server');
 
 const TEST_DIR = path.join(__dirname, '.test-server-accounts');
 const STATE_PATH = path.join(TEST_DIR, 'accounts.json');
 const TOKEN_PATH = path.join(TEST_DIR, 'tokens.json');
 const TELEGRAM_PATH = path.join(TEST_DIR, 'telegram.json');
+
+// This host's first non-loopback IPv4, or null when it only has loopback.
+// Used to make a request whose socket address is genuinely off-box.
+const nonLoopbackAddress = () => {
+  const found = Object.values(os.networkInterfaces())
+    .flat()
+    .find(item => item && item.family === 'IPv4' && !item.internal);
+  return found ? found.address : null;
+};
 
 const server = () => http.createServer(handleRequest);
 
@@ -56,7 +67,16 @@ const completeLogin = async (tokens) => {
 
 beforeAll(() => {
   nock.disableNetConnect();
-  nock.enableNetConnect('127.0.0.1');
+  // enableNetConnect replaces its matcher rather than accumulating, so one
+  // regex covers loopback plus this host's own address: one test talks to the
+  // non-loopback address to prove the allowlist reads the socket, not a header.
+  // nock passes "host:port" to the matcher, so the anchors must allow the port.
+  const host = nonLoopbackAddress();
+  const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = host
+    ? new RegExp(`^(127\\.0\\.0\\.1|::1|${escape(host)})(:|$)`)
+    : /^(127\.0\.0\.1|::1)(:|$)/;
+  nock.enableNetConnect(pattern);
 });
 
 afterAll(() => {
@@ -533,6 +553,390 @@ describe('POST /v1/messages 5-hour window recording', () => {
   });
 });
 
+describe('GET /limits', () => {
+  const usageReply = (session = 96, weekly = 46) => ({
+    limits: [
+      {
+        kind: 'session',
+        percent: session,
+        severity: session >= 90 ? 'critical' : 'normal',
+        resets_at: '2026-11-24T10:00:00+00:00',
+        is_active: false
+      },
+      {
+        kind: 'weekly_all',
+        percent: weekly,
+        severity: 'normal',
+        resets_at: '2026-11-28T01:00:00+00:00',
+        is_active: true
+      }
+    ],
+    spend: { enabled: false }
+  });
+
+  const addAccount = (suffix) => OAuthManager.addAccount({
+    access_token: `access-${suffix}`,
+    refresh_token: `refresh-${suffix}`,
+    expires_at: Date.now() + 3600000
+  }, {
+    account_uuid: `uuid-${suffix}`,
+    organization_uuid: `org-${suffix}`,
+    email: `${suffix}@example.com`
+  });
+
+  afterEach(() => {
+    delete process.env.LIMITS_ALLOWLIST;
+    Usage.clearUsageCache();
+  });
+
+  it('returns a simple JSON array of accounts with their limits', async () => {
+    const account = addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+
+    const response = await request(server()).get('/limits');
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toMatch(/application\/json/);
+    expect(response.body.timezone).toBe('Asia/Jakarta');
+    expect(response.body.generated_at).toEqual(expect.any(String));
+    expect(Array.isArray(response.body.accounts)).toBe(true);
+
+    expect(response.body.accounts).toHaveLength(1);
+    expect(response.body.accounts[0]).toMatchObject({
+      id: account.id,
+      label: 'a@example.com',
+      email: 'a@example.com',
+      active: true,
+      disabled: false,
+      ok: true,
+      stale: false
+    });
+    expect(response.body.accounts[0].limits).toHaveLength(2);
+    expect(response.body.accounts[0].limits[0]).toMatchObject({
+      kind: 'session',
+      title: '5 jam',
+      percent_used: 96,
+      percent_remaining: 4,
+      severity: 'critical',
+      exhausted: false,
+      is_active: false
+    });
+    expect(response.body.accounts[0].limits[1]).toMatchObject({
+      kind: 'weekly_all',
+      title: '7 hari',
+      is_active: true
+    });
+    // Never leak the credential itself.
+    expect(JSON.stringify(response.body)).not.toContain('access-a');
+    expect(JSON.stringify(response.body)).not.toContain('refresh-a');
+  });
+
+  it('marks a fully used window as exhausted', async () => {
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply(100, 10));
+
+    const response = await request(server()).get('/limits');
+
+    expect(response.body.accounts[0].limits[0]).toMatchObject({
+      percent_used: 100,
+      percent_remaining: 0,
+      exhausted: true
+    });
+  });
+
+  it('includes a reset countdown and an ISO reset time', async () => {
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+
+    const response = await request(server()).get('/limits');
+    const limit = response.body.accounts[0].limits[0];
+
+    expect(limit.resets_at).toBe('2026-11-24T10:00:00.000Z');
+    expect(limit.resets_in_seconds).toEqual(expect.any(Number));
+  });
+
+  it('reports credits only when the account reports them', async () => {
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, {
+      limits: [{ kind: 'session', percent: 10, severity: 'normal' }]
+    });
+
+    const without = await request(server()).get('/limits');
+    expect(without.body.accounts[0].credits).toBeNull();
+
+    Usage.clearUsageCache();
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, {
+      limits: [{ kind: 'session', percent: 10, severity: 'normal' }],
+      spend: {
+        enabled: true,
+        percent: 20,
+        used: { amount_minor: 250, exponent: 2, currency: 'USD' },
+        limit: { amount_minor: 1000, exponent: 2 },
+        balance: { amount_minor: 750, exponent: 2 }
+      }
+    });
+
+    const withCredits = await request(server()).get('/limits');
+    expect(withCredits.body.accounts[0].credits).toEqual({
+      percent_used: 20,
+      used: 2.5,
+      limit: 10,
+      balance: 7.5,
+      currency: 'USD'
+    });
+  });
+
+  it('keeps the other accounts when one upstream call fails', async () => {
+    addAccount('bad');
+    addAccount('good');
+    nock('https://api.anthropic.com')
+      .persist()
+      .get('/api/oauth/usage')
+      .reply(function () {
+        const token = String(this.req.headers.authorization).replace('Bearer ', '');
+        return token === 'access-bad'
+          ? [500, 'boom']
+          : [200, JSON.stringify(usageReply())];
+      });
+
+    const response = await request(server()).get('/limits');
+
+    expect(response.status).toBe(200);
+    const bad = response.body.accounts.find(a => a.label === 'bad@example.com');
+    const good = response.body.accounts.find(a => a.label === 'good@example.com');
+    expect(bad).toMatchObject({ ok: false, limits: [], credits: null });
+    expect(bad.error).toMatch(/500/);
+    expect(good).toMatchObject({ ok: true });
+    expect(good.limits).toHaveLength(2);
+  });
+
+  it('does not need the proxy API key', async () => {
+    process.env.PROXY_API_KEY = 'secret-key';
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+
+    const response = await request(server()).get('/limits');
+
+    expect(response.status).toBe(200);
+    expect(response.body.accounts).toHaveLength(1);
+  });
+
+  it('always allows loopback, even when the allowlist names only the VPN', async () => {
+    process.env.LIMITS_ALLOWLIST = '10.8.0.0/24';
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+
+    // supertest connects over 127.0.0.1: an app on this machine must work
+    // without the operator having to remember to list loopback.
+    const response = await request(server()).get('/limits');
+
+    expect(response.status).toBe(200);
+  });
+
+  it('refuses a socket address outside the allowlist', async () => {
+    // No LIMITS_ALLOWLIST set: this is the shipped default, which must be
+    // loopback only. A private range baked into the code would show up here as
+    // a 200 and a wide allowlist in the refusal body.
+    delete process.env.LIMITS_ALLOWLIST;
+    addAccount('a');
+    const scope = nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+
+    // Bind to this host's non-loopback address and connect to it, so the
+    // server sees a real socket address outside both the VPN range and
+    // loopback. A spoofed X-Forwarded-For must not change the outcome.
+    const address = nonLoopbackAddress();
+    if (!address) return;
+
+    const listener = http.createServer(handleRequest);
+    await new Promise(resolve => listener.listen(0, '0.0.0.0', resolve));
+    try {
+      const response = await new Promise((resolve, reject) => {
+        const req = http.request({
+          host: address,
+          port: listener.address().port,
+          path: '/limits',
+          headers: { 'X-Forwarded-For': '10.8.0.5' }
+        }, (res) => {
+          let body = '';
+          res.on('data', chunk => { body += chunk; });
+          res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+
+      expect(response.status).toBe(403);
+      const body = JSON.parse(response.body);
+      expect(body.error).toMatch(/not allowed/);
+      expect(body.allowlist).toEqual(['127.0.0.1/32', '::1/128']);
+      expect(scope.isDone()).toBe(false);
+    } finally {
+      await new Promise(resolve => listener.close(resolve));
+    }
+  });
+
+  it('serves the cached snapshot within the cache window', async () => {
+    addAccount('a');
+    const scope = nock('https://api.anthropic.com')
+      .get('/api/oauth/usage')
+      .once()
+      .reply(200, usageReply());
+
+    await request(server()).get('/limits');
+    const second = await request(server()).get('/limits');
+
+    expect(second.status).toBe(200);
+    expect(scope.isDone()).toBe(true);
+    // The second call was served from the in-process cache.
+    expect(nock.pendingMocks()).toEqual([]);
+  });
+
+  it('forces a fresh read with ?refresh=1', async () => {
+    addAccount('a');
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply());
+    nock('https://api.anthropic.com').get('/api/oauth/usage').reply(200, usageReply(50, 50));
+
+    const first = await request(server()).get('/limits');
+    const second = await request(server()).get('/limits').query({ refresh: 1 });
+
+    expect(first.body.accounts[0].limits[0].percent_used).toBe(96);
+    expect(second.body.accounts[0].limits[0].percent_used).toBe(50);
+  });
+
+  it('returns an empty array when no accounts are stored', async () => {
+    const response = await request(server()).get('/limits');
+
+    expect(response.status).toBe(200);
+    expect(response.body.accounts).toEqual([]);
+  });
+});
+
+describe('limit report routes', () => {
+  const preview = (expression) => request(server())
+    .get('/auth/settings/telegram/cron-preview')
+    .query({ expression });
+
+  it('describes a cron expression in plain Indonesian with its next run', async () => {
+    const response = await preview('0 8 * * *');
+
+    expect(response.status).toBe(200);
+    expect(response.body.valid).toBe(true);
+    expect(response.body.description).toBe('Setiap hari pukul 08:00');
+    expect(response.body.next_run).toMatch(/WIB$/);
+  });
+
+  it('rejects a malformed expression and explains why', async () => {
+    const response = await preview('0 8 * *');
+
+    expect(response.status).toBe(200);
+    expect(response.body.valid).toBe(false);
+    expect(response.body.error).toMatch(/5 fields/);
+  });
+
+  it('stores the limit fields and returns the schedule description', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram')
+      .send({
+        bot_token: '123:abc',
+        chat_id: '-100123',
+        limit_alerts_enabled: false,
+        limit_alert_threshold: 15,
+        limit_report_cron: '30 7 * * 1-5'
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      limit_alerts_enabled: false,
+      limit_alert_threshold: 15,
+      limit_report_cron: '30 7 * * 1-5'
+    });
+    expect(response.body.schedule.valid).toBe(true);
+    expect(response.body.schedule.description)
+      .toBe('Setiap hari kerja (Senin–Jumat) pukul 07:30');
+  });
+
+  it('refuses to store a cron expression the scheduler could not run', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram')
+      .send({ bot_token: '123:abc', chat_id: '-100123', limit_report_cron: 'every day' });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toMatch(/Invalid cron expression/);
+    expect(fs.existsSync(TELEGRAM_PATH)).toBe(false);
+  });
+
+  it('validates the threshold range and the boolean flag', async () => {
+    const threshold = await request(server())
+      .post('/auth/settings/telegram')
+      .send({ chat_id: '-100123', limit_alert_threshold: 0 });
+    expect(threshold.status).toBe(400);
+    expect(threshold.body)
+      .toEqual({ error: 'limit_alert_threshold must be a number between 1 and 100' });
+
+    const flag = await request(server())
+      .post('/auth/settings/telegram')
+      .send({ chat_id: '-100123', limit_alerts_enabled: 'yes' });
+    expect(flag.status).toBe(400);
+    expect(flag.body).toEqual({ error: 'limit_alerts_enabled must be a boolean' });
+  });
+
+  it('refuses a report before Telegram is configured', async () => {
+    const response = await request(server()).post('/auth/settings/telegram/report');
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'Telegram is not configured' });
+  });
+
+  it('sends the report on demand and returns what went out', async () => {
+    await request(server())
+      .post('/auth/settings/telegram')
+      .send({ bot_token: '123:abc', chat_id: '-100123' });
+    OAuthManager.addAccount({
+      access_token: 'access-a',
+      refresh_token: 'refresh-a',
+      expires_at: Date.now() + 3600000
+    }, {
+      account_uuid: 'uuid-a',
+      organization_uuid: 'org-a',
+      email: 'a@example.com'
+    });
+
+    const sent = [];
+    nock('https://api.anthropic.com')
+      .get('/api/oauth/usage')
+      .reply(200, {
+        limits: [{
+          kind: 'session',
+          percent: 12,
+          severity: 'normal',
+          resets_at: new Date(Date.now() + 3600000).toISOString()
+        }]
+      });
+    nock('https://api.telegram.org')
+      .post('/bot123:abc/sendMessage')
+      .reply(200, function (uri, requestBody) {
+        sent.push(requestBody.text);
+        return { ok: true };
+      });
+
+    const response = await request(server()).post('/auth/settings/telegram/report');
+
+    expect(response.status).toBe(200);
+    expect(response.body.sent).toBe(true);
+    expect(response.body.preview).toContain('Akun: a@example.com [aktif]');
+    expect(sent[0]).toContain('5 jam');
+  });
+
+  it('rejects a cross-origin report', async () => {
+    const response = await request(server())
+      .post('/auth/settings/telegram/report')
+      .set('Origin', 'http://evil.example');
+
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ error: 'Cross-origin request rejected' });
+  });
+});
+
 describe('CORS headers', () => {
   it('includes CORS headers in all responses', async () => {
     const response = await request(server()).get('/auth/status');
@@ -558,8 +962,16 @@ describe('telegram settings routes', () => {
     const response = await request(server()).get('/auth/settings/telegram');
 
     expect(response.status).toBe(200);
-    expect(response.body)
-      .toEqual({ chat_id: '', silent_models: [], bot_token_set: false, configured: false });
+    expect(response.body).toEqual({
+      chat_id: '',
+      silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
+      bot_token_set: false,
+      configured: false,
+      schedule: { valid: true }
+    });
   });
 
   it('stores the token and chat id without echoing the token', async () => {
@@ -569,11 +981,21 @@ describe('telegram settings routes', () => {
     expect(response.body).toEqual({
       chat_id: '-100123',
       silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
       bot_token_set: true,
-      configured: true
+      configured: true,
+      schedule: { valid: true }
     });
-    expect(storedSettings())
-      .toEqual({ bot_token: '123:abc', chat_id: '-100123', silent_models: [] });
+    expect(storedSettings()).toEqual({
+      bot_token: '123:abc',
+      chat_id: '-100123',
+      silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: ''
+    });
     expect(fs.statSync(TELEGRAM_PATH).mode & 0o777).toBe(0o600);
   });
 
@@ -586,11 +1008,21 @@ describe('telegram settings routes', () => {
     expect(response.body).toEqual({
       chat_id: '-100456',
       silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
       bot_token_set: true,
-      configured: true
+      configured: true,
+      schedule: { valid: true }
     });
-    expect(storedSettings())
-      .toEqual({ bot_token: '123:abc', chat_id: '-100456', silent_models: [] });
+    expect(storedSettings()).toEqual({
+      bot_token: '123:abc',
+      chat_id: '-100456',
+      silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: ''
+    });
   });
 
   it('turns notifications off when the chat id is emptied', async () => {
@@ -599,8 +1031,16 @@ describe('telegram settings routes', () => {
     const response = await save({ chat_id: '' });
 
     expect(response.status).toBe(200);
-    expect(response.body)
-      .toEqual({ chat_id: '', silent_models: [], bot_token_set: true, configured: false });
+    expect(response.body).toEqual({
+      chat_id: '',
+      silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
+      bot_token_set: true,
+      configured: false,
+      schedule: { valid: true }
+    });
     expect(storedSettings().chat_id).toBe('');
   });
 
@@ -611,8 +1051,12 @@ describe('telegram settings routes', () => {
     expect(response.body).toEqual({
       chat_id: '-100123:534',
       silent_models: [],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: '',
       bot_token_set: true,
-      configured: true
+      configured: true,
+      schedule: { valid: true }
     });
     expect(storedSettings().chat_id).toBe('-100123:534');
   });
@@ -688,7 +1132,10 @@ describe('telegram settings routes', () => {
     expect(storedSettings()).toEqual({
       bot_token: '123:abc',
       chat_id: '-100456',
-      silent_models: ['haiku']
+      silent_models: ['haiku'],
+      limit_alerts_enabled: true,
+      limit_alert_threshold: 10,
+      limit_report_cron: ''
     });
   });
 
